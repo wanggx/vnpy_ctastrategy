@@ -13,8 +13,9 @@ class CtaTemplate(ABC):
     """"""
 
     author: str = ""
-    parameters: list = []
+    parameters: list = ["t1"]
     variables: list = []
+    t1: bool = False
 
     def __init__(
         self,
@@ -31,6 +32,11 @@ class CtaTemplate(ABC):
         self.inited: bool = False
         self.trading: bool = False
         self.pos: float = 0
+        self.yd_pos: float = 0
+        self.td_pos: float = 0
+        self.local_sell_frozen: float = 0
+        self.position_synced: bool = False
+        self.position_sync_time: str = ""
 
         # Copy a new variables list here to avoid duplicate insert when multiple
         # strategy instances are created with the same strategy class.
@@ -38,6 +44,15 @@ class CtaTemplate(ABC):
         self.variables.insert(0, "inited")
         self.variables.insert(1, "trading")
         self.variables.insert(2, "pos")
+        for name in [
+            "yd_pos",
+            "td_pos",
+            "local_sell_frozen",
+            "position_synced",
+            "position_sync_time"
+        ]:
+            if name not in self.variables:
+                self.variables.append(name)
 
         self.update_setting(setting)
 
@@ -45,7 +60,7 @@ class CtaTemplate(ABC):
         """
         Update strategy parameter wtih value in setting dict.
         """
-        for name in self.parameters:
+        for name in self.get_class_parameter_names():
             if name in setting:
                 setattr(self, name, setting[name])
 
@@ -55,16 +70,27 @@ class CtaTemplate(ABC):
         Get default parameters dict of strategy class.
         """
         class_parameters: dict = {}
-        for name in cls.parameters:
+        parameters: list = cls.get_class_parameter_names()
+        for name in parameters:
             class_parameters[name] = getattr(cls, name)
         return class_parameters
+
+    @classmethod
+    def get_class_parameter_names(cls) -> list:
+        """
+        Get parameter names with base parameters included.
+        """
+        parameters: list = copy(cls.parameters)
+        if "t1" not in parameters:
+            parameters.insert(0, "t1")
+        return parameters
 
     def get_parameters(self) -> dict:
         """
         Get strategy parameters dict.
         """
         strategy_parameters: dict = {}
-        for name in self.parameters:
+        for name in self.get_class_parameter_names():
             strategy_parameters[name] = getattr(self, name)
         return strategy_parameters
 
@@ -193,6 +219,10 @@ class CtaTemplate(ABC):
         """
         Send short order to open as short position.
         """
+        if self.t1:
+            self.write_log("T+1 mode does not support short orders")
+            return []
+
         return self.send_order(
             Direction.SHORT,
             Offset.OPEN,
@@ -214,6 +244,10 @@ class CtaTemplate(ABC):
         """
         Send cover order to close a short position.
         """
+        if self.t1:
+            self.write_log("T+1 mode does not support cover orders")
+            return []
+
         return self.send_order(
             Direction.LONG,
             Offset.CLOSE,
@@ -447,6 +481,10 @@ class TargetPosTemplate(CtaTemplate):
         if not pos_change:
             return
 
+        if self.t1 and self.target_pos < 0:
+            self.write_log("T+1 mode does not support negative target position")
+            return
+
         long_price: float = 0
         short_price: float = 0
 
@@ -469,6 +507,8 @@ class TargetPosTemplate(CtaTemplate):
         if self.get_engine_type() == EngineType.BACKTESTING:
             if pos_change > 0:
                 vt_orderids: list[str] = self.buy(long_price, abs(pos_change))
+            elif self.t1:
+                vt_orderids = self.sell(short_price, abs(pos_change))
             else:
                 vt_orderids = self.short(short_price, abs(pos_change))
             self.active_orderids.extend(vt_orderids)

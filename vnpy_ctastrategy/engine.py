@@ -24,11 +24,13 @@ from vnpy.trader.object import (
     OrderData,
     TradeData,
     ContractData,
+    PositionData,
 )
 from vnpy.trader.event import (
     EVENT_TICK,
     EVENT_ORDER,
-    EVENT_TRADE
+    EVENT_TRADE,
+    EVENT_POSITION
 )
 from vnpy.trader.constant import (
     Direction,
@@ -94,6 +96,8 @@ class CtaEngine(BaseEngine):
         self.init_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
         self.vt_tradeids: set = set()                                   # for filtering duplicate trade
+        self.sell_frozen_by_orderid: dict[str, float] = {}
+        self.sell_traded_by_orderid: dict[str, float] = {}
 
         self.database: BaseDatabase = get_database()
         self.datafeed: BaseDatafeed = get_datafeed()
@@ -116,6 +120,7 @@ class CtaEngine(BaseEngine):
         self.event_engine.register(EVENT_TICK, self.process_tick_event)
         self.event_engine.register(EVENT_ORDER, self.process_order_event)
         self.event_engine.register(EVENT_TRADE, self.process_trade_event)
+        self.event_engine.register(EVENT_POSITION, self.process_position_event)
 
         log_engine: LogEngine = self.main_engine.get_engine("log")  # type: ignore
         log_engine.register_log(EVENT_CTA_LOG)
@@ -166,6 +171,13 @@ class CtaEngine(BaseEngine):
         if not strategy:
             return
 
+        if strategy.t1 and order.status in {Status.CANCELLED, Status.REJECTED}:
+            self.release_t1_sell_frozen(
+                strategy,
+                order.vt_orderid,
+                self.sell_frozen_by_orderid.get(order.vt_orderid, 0)
+            )
+
         # Remove vt_orderid if order is no longer active.
         vt_orderids: set = self.strategy_orderid_map[strategy.strategy_name]
         if order.vt_orderid in vt_orderids and not order.is_active():
@@ -203,11 +215,14 @@ class CtaEngine(BaseEngine):
         if not strategy:
             return
 
-        # Update strategy pos before calling on_trade method
-        if trade.direction == Direction.LONG:
-            strategy.pos += trade.volume
+        if strategy.t1:
+            self.update_t1_trade(strategy, trade)
         else:
-            strategy.pos -= trade.volume
+            # Update strategy pos before calling on_trade method
+            if trade.direction == Direction.LONG:
+                strategy.pos += trade.volume
+            else:
+                strategy.pos -= trade.volume
 
         self.call_strategy_func(strategy, strategy.on_trade, trade)
 
@@ -216,6 +231,131 @@ class CtaEngine(BaseEngine):
 
         # Update GUI
         self.put_strategy_event(strategy)
+
+    def process_position_event(self, event: Event) -> None:
+        """"""
+        position: PositionData = event.data
+
+        if position.direction != Direction.LONG:
+            return
+
+        strategies: list = self.symbol_strategy_map[position.vt_symbol]
+        for strategy in strategies:
+            if not strategy.t1:
+                continue
+
+            self.sync_t1_position(strategy, position)
+            self.put_strategy_event(strategy)
+
+    def sync_t1_position(self, strategy: CtaTemplate, position: PositionData) -> None:
+        """"""
+        strategy.pos = position.volume
+        strategy.yd_pos = position.yd_volume
+        strategy.td_pos = max(position.volume - position.yd_volume, 0)
+        strategy.position_synced = True
+        strategy.position_sync_time = datetime.now(DB_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    def init_t1_position(self, strategy: CtaTemplate) -> None:
+        """"""
+        for position in self.main_engine.get_all_positions():
+            if position.vt_symbol == strategy.vt_symbol and position.direction == Direction.LONG:
+                self.sync_t1_position(strategy, position)
+                break
+
+        contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
+        if not contract:
+            return
+
+        gateway = self.main_engine.get_gateway(contract.gateway_name)
+        if gateway:
+            gateway.query_position()
+
+    def is_t1_sell_order(self, strategy: CtaTemplate, direction: Direction, offset: Offset) -> bool:
+        """"""
+        return strategy.t1 and direction == Direction.SHORT and offset == Offset.CLOSE
+
+    def check_t1_order(
+        self,
+        strategy: CtaTemplate,
+        direction: Direction,
+        offset: Offset,
+        volume: float
+    ) -> bool:
+        """"""
+        if not strategy.t1:
+            return True
+
+        if direction == Direction.SHORT and offset != Offset.CLOSE:
+            self.write_log("T+1 mode rejects short open orders", strategy)
+            return False
+
+        if direction == Direction.LONG and offset == Offset.CLOSE:
+            self.write_log("T+1 mode rejects cover orders", strategy)
+            return False
+
+        if volume % 100:
+            self.write_log(f"A-share mode requires volume in lots of 100: {volume}", strategy)
+            return False
+
+        if self.is_t1_sell_order(strategy, direction, offset):
+            if not strategy.position_synced:
+                self.write_log("T+1 mode rejects sell order before position sync", strategy)
+                return False
+
+            available: float = max(strategy.yd_pos - strategy.local_sell_frozen, 0)
+            if volume > available:
+                self.write_log(
+                    f"T+1 sellable position is insufficient: order={volume}, available={available}",
+                    strategy
+                )
+                return False
+
+        return True
+
+    def freeze_t1_sell(self, strategy: CtaTemplate, vt_orderid: str, volume: float) -> None:
+        """"""
+        if not strategy.t1 or not volume:
+            return
+
+        strategy.local_sell_frozen += volume
+        self.sell_frozen_by_orderid[vt_orderid] = self.sell_frozen_by_orderid.get(vt_orderid, 0) + volume
+
+    def release_t1_sell_frozen(self, strategy: CtaTemplate, vt_orderid: str, volume: float) -> None:
+        """"""
+        if not strategy.t1 or volume <= 0:
+            return
+
+        frozen: float = self.sell_frozen_by_orderid.get(vt_orderid, 0)
+        release_volume: float = min(volume, frozen)
+        strategy.local_sell_frozen = max(strategy.local_sell_frozen - release_volume, 0)
+
+        frozen -= release_volume
+        if frozen > 0:
+            self.sell_frozen_by_orderid[vt_orderid] = frozen
+        else:
+            self.sell_frozen_by_orderid.pop(vt_orderid, None)
+            self.sell_traded_by_orderid.pop(vt_orderid, None)
+
+    def update_t1_trade(self, strategy: CtaTemplate, trade: TradeData) -> None:
+        """"""
+        if trade.direction == Direction.LONG:
+            strategy.pos += trade.volume
+            if trade.offset == Offset.OPEN:
+                strategy.td_pos += trade.volume
+        else:
+            strategy.pos -= trade.volume
+            if trade.offset == Offset.CLOSE:
+                strategy.yd_pos = max(strategy.yd_pos - trade.volume, 0)
+                strategy.local_sell_frozen = max(strategy.local_sell_frozen - trade.volume, 0)
+                self.sell_traded_by_orderid[trade.vt_orderid] = (
+                    self.sell_traded_by_orderid.get(trade.vt_orderid, 0) + trade.volume
+                )
+                frozen: float = self.sell_frozen_by_orderid.get(trade.vt_orderid, 0) - trade.volume
+                if frozen > 0:
+                    self.sell_frozen_by_orderid[trade.vt_orderid] = frozen
+                else:
+                    self.sell_frozen_by_orderid.pop(trade.vt_orderid, None)
+                    self.sell_traded_by_orderid.pop(trade.vt_orderid, None)
 
     def check_stop_order(self, tick: TickData) -> None:
         """"""
@@ -251,6 +391,11 @@ class CtaEngine(BaseEngine):
                 if not contract:
                     continue
 
+                released_stop_volume: float = 0
+                if self.is_t1_sell_order(strategy, stop_order.direction, stop_order.offset):
+                    released_stop_volume = self.sell_frozen_by_orderid.get(stop_order.stop_orderid, 0)
+                    self.release_t1_sell_frozen(strategy, stop_order.stop_orderid, released_stop_volume)
+
                 vt_orderids: list = self.send_limit_order(
                     strategy,
                     contract,
@@ -279,6 +424,8 @@ class CtaEngine(BaseEngine):
                         strategy, strategy.on_stop_order, stop_order
                     )
                     self.put_stop_order_event(stop_order)
+                elif released_stop_volume:
+                    self.freeze_t1_sell(strategy, stop_order.stop_orderid, released_stop_volume)
 
     def send_server_order(
         self,
@@ -332,6 +479,9 @@ class CtaEngine(BaseEngine):
             # Save relationship between orderid and strategy.
             self.orderid_strategy_map[vt_orderid] = strategy
             self.strategy_orderid_map[strategy.strategy_name].add(vt_orderid)
+
+            if self.is_t1_sell_order(strategy, req.direction, req.offset):
+                self.freeze_t1_sell(strategy, vt_orderid, req.volume)
 
         return vt_orderids
 
@@ -424,6 +574,9 @@ class CtaEngine(BaseEngine):
         vt_orderids: set = self.strategy_orderid_map[strategy.strategy_name]
         vt_orderids.add(stop_orderid)
 
+        if self.is_t1_sell_order(strategy, direction, offset):
+            self.freeze_t1_sell(strategy, stop_orderid, volume)
+
         self.call_strategy_func(strategy, strategy.on_stop_order, stop_order)
         self.put_stop_order_event(stop_order)
 
@@ -460,6 +613,12 @@ class CtaEngine(BaseEngine):
         # Change stop order status to cancelled and update to strategy.
         stop_order.status = StopOrderStatus.CANCELLED
 
+        self.release_t1_sell_frozen(
+            strategy,
+            stop_orderid,
+            self.sell_frozen_by_orderid.get(stop_orderid, 0)
+        )
+
         self.call_strategy_func(strategy, strategy.on_stop_order, stop_order)
         self.put_stop_order_event(stop_order)
 
@@ -484,6 +643,9 @@ class CtaEngine(BaseEngine):
         # Round order price and volume to nearest incremental value
         price = round_to(price, contract.pricetick)
         volume = round_to(volume, contract.min_volume)
+
+        if not self.check_t1_order(strategy, direction, offset, volume):
+            return []
 
         if stop:
             if contract.stop_supported:
@@ -718,6 +880,9 @@ class CtaEngine(BaseEngine):
             self.write_log(_("{}已经启动，请勿重复操作").format(strategy_name))
             return
 
+        if strategy.t1:
+            self.init_t1_position(strategy)
+
         self.call_strategy_func(strategy, strategy.on_start)
         strategy.trading = True
 
@@ -860,7 +1025,7 @@ class CtaEngine(BaseEngine):
         strategy_class: type[CtaTemplate] = self.classes[class_name]
 
         parameters: dict = {}
-        for name in strategy_class.parameters:
+        for name in strategy_class.get_class_parameter_names():
             parameters[name] = getattr(strategy_class, name)
 
         return parameters
@@ -911,6 +1076,7 @@ class CtaEngine(BaseEngine):
         Update setting file.
         """
         strategy: CtaTemplate = self.strategies[strategy_name]
+        setting = strategy.get_parameters()
 
         self.strategy_setting[strategy_name] = {
             "class_name": strategy.__class__.__name__,

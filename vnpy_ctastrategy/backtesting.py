@@ -65,6 +65,8 @@ class BacktestingEngine:
         self.annual_days: int = 240
         self.half_life: int = 120
         self.mode: BacktestingMode = BacktestingMode.BAR
+        self.t1: bool = False
+        self.t1_trading_date: Date | None = None
 
         self.strategy_class: type[CtaTemplate]
         self.strategy: CtaTemplate
@@ -87,6 +89,7 @@ class BacktestingEngine:
 
         self.trade_count: int = 0
         self.trades: dict[str, TradeData] = {}
+        self.sell_frozen_by_orderid: dict[str, float] = {}
 
         self.logs: list = []
 
@@ -107,6 +110,8 @@ class BacktestingEngine:
 
         self.trade_count = 0
         self.trades.clear()
+        self.sell_frozen_by_orderid.clear()
+        self.t1_trading_date = None
 
         self.logs.clear()
         self.daily_results.clear()
@@ -125,7 +130,8 @@ class BacktestingEngine:
         mode: BacktestingMode = BacktestingMode.BAR,
         risk_free: float = 0,
         annual_days: int = 240,
-        half_life: int = 120
+        half_life: int = 120,
+        t1: bool = False
     ) -> None:
         """"""
         self.mode = mode
@@ -150,6 +156,7 @@ class BacktestingEngine:
         self.risk_free = risk_free
         self.annual_days = annual_days
         self.half_life = half_life
+        self.t1 = t1
 
     def add_strategy(self, strategy_class: type[CtaTemplate], setting: dict) -> None:
         """"""
@@ -157,6 +164,7 @@ class BacktestingEngine:
         self.strategy = strategy_class(
             self, strategy_class.__name__, self.vt_symbol, setting
         )
+        self.strategy.t1 = self.t1
 
     def load_data(self) -> None:
         """"""
@@ -636,6 +644,92 @@ class BacktestingEngine:
 
         return results
 
+    def is_t1_sell_order(self, direction: Direction, offset: Offset) -> bool:
+        """"""
+        return self.t1 and direction == Direction.SHORT and offset == Offset.CLOSE
+
+    def check_t1_order(self, direction: Direction, offset: Offset, volume: float) -> bool:
+        """"""
+        if not self.t1:
+            return True
+
+        if direction == Direction.SHORT and offset != Offset.CLOSE:
+            self.output(f"{self.datetime}\tT+1 mode rejects short open orders")
+            return False
+
+        if direction == Direction.LONG and offset == Offset.CLOSE:
+            self.output(f"{self.datetime}\tT+1 mode rejects cover orders")
+            return False
+
+        if volume % 100:
+            self.output(f"{self.datetime}\tA-share mode requires volume in lots of 100: {volume}")
+            return False
+
+        if self.is_t1_sell_order(direction, offset):
+            available: float = max(self.strategy.yd_pos - self.strategy.local_sell_frozen, 0)
+            if volume > available:
+                self.output(
+                    f"{self.datetime}\tT+1 sellable position is insufficient: "
+                    f"order={volume}, available={available}"
+                )
+                return False
+
+        return True
+
+    def freeze_t1_sell(self, vt_orderid: str, volume: float) -> None:
+        """"""
+        if not self.t1 or not volume:
+            return
+
+        self.strategy.local_sell_frozen += volume
+        self.sell_frozen_by_orderid[vt_orderid] = self.sell_frozen_by_orderid.get(vt_orderid, 0) + volume
+
+    def release_t1_sell_frozen(self, vt_orderid: str, volume: float) -> None:
+        """"""
+        if not self.t1 or volume <= 0:
+            return
+
+        frozen: float = self.sell_frozen_by_orderid.get(vt_orderid, 0)
+        release_volume: float = min(volume, frozen)
+        self.strategy.local_sell_frozen = max(self.strategy.local_sell_frozen - release_volume, 0)
+
+        frozen -= release_volume
+        if frozen > 0:
+            self.sell_frozen_by_orderid[vt_orderid] = frozen
+        else:
+            self.sell_frozen_by_orderid.pop(vt_orderid, None)
+
+    def update_t1_trade(self, trade: TradeData) -> None:
+        """"""
+        if trade.direction == Direction.LONG:
+            self.strategy.pos += trade.volume
+            if trade.offset == Offset.OPEN:
+                self.strategy.td_pos += trade.volume
+        else:
+            self.strategy.pos -= trade.volume
+            if trade.offset == Offset.CLOSE:
+                self.strategy.yd_pos = max(self.strategy.yd_pos - trade.volume, 0)
+                self.release_t1_sell_frozen(trade.vt_orderid, trade.volume)
+
+    def update_t1_trading_date(self, dt: datetime) -> None:
+        """"""
+        if not self.t1:
+            return
+
+        trading_date: Date = dt.date()
+        if self.t1_trading_date is None:
+            self.t1_trading_date = trading_date
+            return
+
+        if trading_date == self.t1_trading_date:
+            return
+
+        self.strategy.yd_pos = max(self.strategy.pos, 0)
+        self.strategy.td_pos = 0
+        self.strategy.local_sell_frozen = 0
+        self.sell_frozen_by_orderid.clear()
+        self.t1_trading_date = trading_date
+
     def update_daily_close(self, price: float) -> None:
         """"""
         d: Date = self.datetime.date()
@@ -648,6 +742,7 @@ class BacktestingEngine:
 
     def new_bar(self, bar: BarData) -> None:
         """"""
+        self.update_t1_trading_date(bar.datetime)
         self.bar = bar
         self.datetime = bar.datetime
 
@@ -659,6 +754,7 @@ class BacktestingEngine:
 
     def new_tick(self, tick: TickData) -> None:
         """"""
+        self.update_t1_trading_date(tick.datetime)
         self.tick = tick
         self.datetime = tick.datetime
 
@@ -736,7 +832,10 @@ class BacktestingEngine:
                 gateway_name=self.gateway_name,
             )
 
-            self.strategy.pos += pos_change
+            if self.t1:
+                self.update_t1_trade(trade)
+            else:
+                self.strategy.pos += pos_change
             self.strategy.on_trade(trade)
 
             self.trades[trade.vt_tradeid] = trade
@@ -790,6 +889,11 @@ class BacktestingEngine:
 
             self.limit_orders[order.vt_orderid] = order
 
+            if self.is_t1_sell_order(order.direction, order.offset):
+                frozen: float = self.sell_frozen_by_orderid.pop(stop_order.stop_orderid, 0)
+                if frozen:
+                    self.sell_frozen_by_orderid[order.vt_orderid] = frozen
+
             # Create trade data.
             if long_cross:
                 trade_price = max(stop_order.price, long_best_price)
@@ -826,7 +930,10 @@ class BacktestingEngine:
             self.strategy.on_stop_order(stop_order)
             self.strategy.on_order(order)
 
-            self.strategy.pos += pos_change
+            if self.t1:
+                self.update_t1_trade(trade)
+            else:
+                self.strategy.pos += pos_change
             self.strategy.on_trade(trade)
 
     def load_bar(
@@ -886,6 +993,10 @@ class BacktestingEngine:
     ) -> list:
         """"""
         price = round_to(price, self.pricetick)
+
+        if not self.check_t1_order(direction, offset, volume):
+            return []
+
         if stop:
             vt_orderid: str = self.send_stop_order(direction, offset, price, volume)
         else:
@@ -916,6 +1027,9 @@ class BacktestingEngine:
         self.active_stop_orders[stop_order.stop_orderid] = stop_order
         self.stop_orders[stop_order.stop_orderid] = stop_order
 
+        if self.is_t1_sell_order(direction, offset):
+            self.freeze_t1_sell(stop_order.stop_orderid, volume)
+
         return stop_order.stop_orderid
 
     def send_limit_order(
@@ -944,6 +1058,9 @@ class BacktestingEngine:
         self.active_limit_orders[order.vt_orderid] = order
         self.limit_orders[order.vt_orderid] = order
 
+        if self.is_t1_sell_order(direction, offset):
+            self.freeze_t1_sell(order.vt_orderid, volume)
+
         return order.vt_orderid
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
@@ -962,6 +1079,7 @@ class BacktestingEngine:
         stop_order: StopOrder = self.active_stop_orders.pop(vt_orderid)
 
         stop_order.status = StopOrderStatus.CANCELLED
+        self.release_t1_sell_frozen(vt_orderid, self.sell_frozen_by_orderid.get(vt_orderid, 0))
         self.strategy.on_stop_order(stop_order)
 
     def cancel_limit_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
@@ -971,6 +1089,7 @@ class BacktestingEngine:
         order: OrderData = self.active_limit_orders.pop(vt_orderid)
 
         order.status = Status.CANCELLED
+        self.release_t1_sell_frozen(vt_orderid, self.sell_frozen_by_orderid.get(vt_orderid, 0))
         self.strategy.on_order(order)
 
     def cancel_all(self, strategy: CtaTemplate) -> None:
@@ -1167,6 +1286,7 @@ def evaluate(
     capital: int,
     end: datetime,
     mode: BacktestingMode,
+    t1: bool,
     setting: dict
 ) -> tuple:
     """
@@ -1184,7 +1304,8 @@ def evaluate(
         pricetick=pricetick,
         capital=capital,
         end=end,
-        mode=mode
+        mode=mode,
+        t1=t1
     )
 
     engine.add_strategy(strategy_class, setting)
@@ -1214,7 +1335,8 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         engine.pricetick,
         engine.capital,
         engine.end,
-        engine.mode
+        engine.mode,
+        engine.t1
     )
     return func
 
