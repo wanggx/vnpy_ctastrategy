@@ -236,7 +236,7 @@ class CtaEngine(BaseEngine):
         """"""
         position: PositionData = event.data
 
-        if position.direction != Direction.LONG:
+        if not self.is_t1_position_direction(position.direction):
             return
 
         strategies: list = self.symbol_strategy_map[position.vt_symbol]
@@ -244,8 +244,19 @@ class CtaEngine(BaseEngine):
             if not strategy.t1:
                 continue
 
+            self.write_log(
+                "T+1 position event: "
+                f"vt_symbol={position.vt_symbol}, direction={position.direction}, "
+                f"volume={position.volume}, yd_volume={position.yd_volume}, "
+                f"frozen={position.frozen}",
+                strategy
+            )
             self.sync_t1_position(strategy, position)
             self.put_strategy_event(strategy)
+
+    def is_t1_position_direction(self, direction: Direction) -> bool:
+        """"""
+        return direction in {Direction.LONG, Direction.NET}
 
     def sync_t1_position(self, strategy: CtaTemplate, position: PositionData) -> None:
         """"""
@@ -254,21 +265,48 @@ class CtaEngine(BaseEngine):
         strategy.td_pos = max(position.volume - position.yd_volume, 0)
         strategy.position_synced = True
         strategy.position_sync_time = datetime.now(DB_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        self.write_log(
+            "T+1 position synced: "
+            f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
+            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}",
+            strategy
+        )
 
     def init_t1_position(self, strategy: CtaTemplate) -> None:
         """"""
+        self.write_log(f"T+1 init position query started: vt_symbol={strategy.vt_symbol}", strategy)
+
+        synced: bool = False
         for position in self.main_engine.get_all_positions():
-            if position.vt_symbol == strategy.vt_symbol and position.direction == Direction.LONG:
+            self.write_log(
+                "T+1 cached position found: "
+                f"vt_symbol={position.vt_symbol}, direction={position.direction}, "
+                f"volume={position.volume}, yd_volume={position.yd_volume}",
+                strategy
+            )
+
+            if (
+                position.vt_symbol == strategy.vt_symbol
+                and self.is_t1_position_direction(position.direction)
+            ):
                 self.sync_t1_position(strategy, position)
+                synced = True
                 break
+
+        if not synced:
+            self.write_log("T+1 no matching cached position found", strategy)
 
         contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
         if not contract:
+            self.write_log(f"T+1 position query skipped, contract not found: {strategy.vt_symbol}", strategy)
             return
 
         gateway = self.main_engine.get_gateway(contract.gateway_name)
         if gateway:
+            self.write_log(f"T+1 requesting latest position from gateway: {contract.gateway_name}", strategy)
             gateway.query_position()
+        else:
+            self.write_log(f"T+1 position query skipped, gateway not found: {contract.gateway_name}", strategy)
 
     def is_t1_sell_order(self, strategy: CtaTemplate, direction: Direction, offset: Offset) -> bool:
         """"""
@@ -284,6 +322,15 @@ class CtaEngine(BaseEngine):
         """"""
         if not strategy.t1:
             return True
+
+        self.write_log(
+            "T+1 order check: "
+            f"direction={direction}, offset={offset}, volume={volume}, "
+            f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
+            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}, "
+            f"position_synced={strategy.position_synced}",
+            strategy
+        )
 
         if direction == Direction.SHORT and offset != Offset.CLOSE:
             self.write_log("T+1 mode rejects short open orders", strategy)
@@ -319,6 +366,12 @@ class CtaEngine(BaseEngine):
 
         strategy.local_sell_frozen += volume
         self.sell_frozen_by_orderid[vt_orderid] = self.sell_frozen_by_orderid.get(vt_orderid, 0) + volume
+        self.write_log(
+            "T+1 sell frozen: "
+            f"vt_orderid={vt_orderid}, volume={volume}, "
+            f"local_sell_frozen={strategy.local_sell_frozen}",
+            strategy
+        )
 
     def release_t1_sell_frozen(self, strategy: CtaTemplate, vt_orderid: str, volume: float) -> None:
         """"""
@@ -328,6 +381,12 @@ class CtaEngine(BaseEngine):
         frozen: float = self.sell_frozen_by_orderid.get(vt_orderid, 0)
         release_volume: float = min(volume, frozen)
         strategy.local_sell_frozen = max(strategy.local_sell_frozen - release_volume, 0)
+        self.write_log(
+            "T+1 sell frozen released: "
+            f"vt_orderid={vt_orderid}, requested={volume}, released={release_volume}, "
+            f"local_sell_frozen={strategy.local_sell_frozen}",
+            strategy
+        )
 
         frozen -= release_volume
         if frozen > 0:
@@ -338,6 +397,15 @@ class CtaEngine(BaseEngine):
 
     def update_t1_trade(self, strategy: CtaTemplate, trade: TradeData) -> None:
         """"""
+        self.write_log(
+            "T+1 trade update before: "
+            f"vt_orderid={trade.vt_orderid}, direction={trade.direction}, "
+            f"offset={trade.offset}, volume={trade.volume}, "
+            f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
+            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}",
+            strategy
+        )
+
         if trade.direction == Direction.LONG:
             strategy.pos += trade.volume
             if trade.offset == Offset.OPEN:
@@ -356,6 +424,13 @@ class CtaEngine(BaseEngine):
                 else:
                     self.sell_frozen_by_orderid.pop(trade.vt_orderid, None)
                     self.sell_traded_by_orderid.pop(trade.vt_orderid, None)
+
+        self.write_log(
+            "T+1 trade update after: "
+            f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
+            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}",
+            strategy
+        )
 
     def check_stop_order(self, tick: TickData) -> None:
         """"""
