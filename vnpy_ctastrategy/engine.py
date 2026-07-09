@@ -408,11 +408,11 @@ class CtaEngine(BaseEngine):
 
         if trade.direction == Direction.LONG:
             strategy.pos += trade.volume
-            if trade.offset == Offset.OPEN:
+            if trade.offset in {Offset.OPEN, Offset.NONE}:
                 strategy.td_pos += trade.volume
         else:
             strategy.pos -= trade.volume
-            if trade.offset == Offset.CLOSE:
+            if trade.offset in {Offset.CLOSE, Offset.NONE}:
                 strategy.yd_pos = max(strategy.yd_pos - trade.volume, 0)
                 strategy.local_sell_frozen = max(strategy.local_sell_frozen - trade.volume, 0)
                 self.sell_traded_by_orderid[trade.vt_orderid] = (
@@ -425,10 +425,20 @@ class CtaEngine(BaseEngine):
                     self.sell_frozen_by_orderid.pop(trade.vt_orderid, None)
                     self.sell_traded_by_orderid.pop(trade.vt_orderid, None)
 
+        stock_compatibility_msg: str = ""
+        if trade.offset == Offset.NONE:
+            stock_compatibility_msg = (
+                ", stock_compatibility=True, "
+                f"vt_orderid={trade.vt_orderid}, vt_tradeid={trade.vt_tradeid}, "
+                f"symbol={trade.vt_symbol}, direction={trade.direction}, "
+                f"offset={trade.offset}, price={trade.price}, volume={trade.volume}"
+            )
+
         self.write_log(
             "T+1 trade update after: "
             f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
-            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}",
+            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}"
+            f"{stock_compatibility_msg}",
             strategy
         )
 
