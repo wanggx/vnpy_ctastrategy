@@ -477,12 +477,12 @@ class TargetPosTemplate(CtaTemplate):
 
     def send_new_order(self) -> None:
         """"""
-        pos_change = self.target_pos - self.pos
-        if not pos_change:
-            return
-
         if self.t1 and self.target_pos < 0:
             self.write_log("T+1 mode does not support negative target position")
+            self.target_pos = 0
+
+        pos_change = self.target_pos - self.pos
+        if not pos_change:
             return
 
         long_price: float = 0
