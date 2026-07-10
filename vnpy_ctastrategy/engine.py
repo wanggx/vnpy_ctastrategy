@@ -244,13 +244,6 @@ class CtaEngine(BaseEngine):
             if not strategy.t1:
                 continue
 
-            self.write_log(
-                "T+1 position event: "
-                f"vt_symbol={position.vt_symbol}, direction={position.direction}, "
-                f"volume={position.volume}, yd_volume={position.yd_volume}, "
-                f"frozen={position.frozen}",
-                strategy
-            )
             self.sync_t1_position(strategy, position)
             self.put_strategy_event(strategy)
 
@@ -265,12 +258,6 @@ class CtaEngine(BaseEngine):
         strategy.td_pos = max(position.volume - position.yd_volume, 0)
         strategy.position_synced = True
         strategy.position_sync_time = datetime.now(DB_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        self.write_log(
-            "T+1 position synced: "
-            f"pos={strategy.pos}, yd_pos={strategy.yd_pos}, "
-            f"td_pos={strategy.td_pos}, local_sell_frozen={strategy.local_sell_frozen}",
-            strategy
-        )
 
     def init_t1_position(self, strategy: CtaTemplate) -> None:
         """"""
