@@ -49,6 +49,11 @@ class T1DoubleMaStrategy(CtaTemplate):
 
     def on_tick(self, tick: TickData) -> None:
         """"""
+        target_name: str = tick.name or tick.vt_symbol
+        #self.write_log(
+        #    f"标的名称：{target_name}，价格：{tick.last_price}，"
+        #    f"累计成交量：{tick.volume}，最新成交量：{tick.last_volume}"
+        #)
         self.bg.update_tick(tick)
 
     def on_bar(self, bar: BarData) -> None:
@@ -65,7 +70,10 @@ class T1DoubleMaStrategy(CtaTemplate):
 
         self.fast_ma = fast_ma[-1]
         self.slow_ma = slow_ma[-1]
-
+        #self.write_log(
+        #    f"最新数据：{bar.datetime}，收盘价：{bar.close_price}，"
+        #    f"快均线：{self.fast_ma}，慢均线：{self.slow_ma}"
+        #)
         if self.fast_ma > self.slow_ma:
             if self.pos <= 0:
                 self.buy(bar.close_price, self.fixed_size)
