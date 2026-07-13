@@ -1,3 +1,5 @@
+from datetime import date, time
+
 import numpy as np
 
 from vnpy.trader.constant import Direction, Offset
@@ -60,9 +62,6 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         "stop_loss_points",
         "profit_take_points",
         "profit_take_min_points",
-        "macd_fast",
-        "macd_slow",
-        "macd_signal",
     ]
     variables = [
         "fast_ma",
@@ -86,8 +85,10 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.close_prices: list[float] = []
         self.macd_values: list[float] = []
         self.daily_close_prices: list[float] = []
-        self.current_day: object | None = None
+        self.current_day: date | None = None
         self.day_close_price: float = 0.0
+        self.macd_trading_day: date | None = None
+        self.active_buy_orders: dict[str, float] = {}
 
     def on_init(self) -> None:
         """策略初始化。"""
@@ -101,6 +102,8 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.daily_close_prices = []
         self.current_day = None
         self.day_close_price = 0.0
+        self.macd_trading_day = None
+        self.active_buy_orders.clear()
         self.avg_price = 0.0
         self.macd_line = 0.0
         self.signal_line = 0.0
@@ -125,6 +128,9 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
     def on_bar(self, bar: BarData) -> None:
         """收到 1 分钟 K 线时执行。"""
+        if not self._prepare_intraday_macd(bar):
+            return
+
         self.cancel_all()
 
         am: ArrayManager = self.am
@@ -136,12 +142,6 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.fast_ma = self._calc_daily_ma(self.fast_window)
         self.slow_ma = self._calc_daily_ma(self.slow_window)
         self.ma10 = self._calc_daily_ma(self.ma10_window)
-
-        self.write_log(
-            f"{bar.datetime} 1m收盘价={bar.close_price:.2f}，"
-            f"日线快线={self.fast_ma:.2f}，日线慢线={self.slow_ma:.2f}，日线10线={self.ma10:.2f}，"
-            f"当前持仓={self.pos}，底仓={self.base_size}，摩擦仓位={self.friction_size}"
-        )
 
         prev_macd_hist: float = self.macd_hist
         self.macd_line, self.signal_line, self.macd_hist = self._calc_macd(bar.close_price)
@@ -208,6 +208,29 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
         self.put_event()
 
+    def _prepare_intraday_macd(self, bar: BarData) -> bool:
+        """切换交易日并过滤 09:30 之前的无效分钟数据。"""
+        trading_day: date = bar.datetime.date()
+
+        if trading_day != self.macd_trading_day:
+            self.macd_trading_day = trading_day
+            self.close_prices.clear()
+            self.macd_values.clear()
+            self.macd_line = 0.0
+            self.signal_line = 0.0
+            self.macd_hist = 0.0
+            self.last_macd_hist = 0.0
+            self.write_log(f"MACD切换交易日={trading_day}，分钟数据和指标已重置")
+
+        if bar.datetime.time() < time(9, 30):
+            self.write_log(
+                f"忽略开盘前数据：时间={bar.datetime}，"
+                f"收盘价={bar.close_price:.2f}，09:30起才参与MACD计算"
+            )
+            return False
+
+        return True
+
     def _update_daily_close_series(self, bar: BarData) -> None:
         """基于 1 分钟数据构造日线收盘价序列。"""
         current_day = bar.datetime.date()
@@ -237,6 +260,10 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.close_prices.append(float(close_price))
 
         if len(self.close_prices) < max(self.macd_fast, self.macd_slow):
+            self.write_log(
+                f"MACD计算来源=自定义代码，收盘价={close_price:.2f}，"
+                "MACD=0.000000，Signal=0.000000，Hist=0.000000（数据不足）"
+            )
             return 0.0, 0.0, 0.0
 
         ema_fast: float = self._ema(self.close_prices, self.macd_fast)
@@ -250,6 +277,10 @@ class BottomFrictionMacdStrategy(CtaTemplate):
             signal_line = self._ema(self.macd_values[-self.macd_signal:], self.macd_signal)
 
         macd_hist: float = macd_line - signal_line
+        self.write_log(
+            f"MACD计算来源=自定义代码，收盘价={close_price:.2f}，"
+            f"MACD={macd_line:.6f}，Signal={signal_line:.6f}，Hist={macd_hist:.6f}"
+        )
         return macd_line, signal_line, macd_hist
 
     def _ema(self, values: list[float], period: int) -> float:
@@ -268,15 +299,26 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
     def _set_target_position(self, bar: BarData, target_pos: float) -> None:
         """根据目标仓位调整多头持仓。"""
-        target_pos = max(0, int(target_pos))
+        max_pos: int = max(0, int(self.base_size)) + max(0, int(self.friction_size))
+        target_pos = min(max_pos, max(0, int(target_pos)))
+        pending_buy_volume: float = sum(self.active_buy_orders.values())
+        effective_pos: float = self.pos + pending_buy_volume
 
-        self.write_log(f"目标仓位={target_pos}，当前仓位={self.pos}，价格={bar.close_price:.2f}")
+        self.write_log(
+            f"目标仓位={target_pos}，当前仓位={self.pos}，"
+            f"未成交买量={pending_buy_volume}，预计总仓位={effective_pos}，"
+            f"价格={bar.close_price:.2f}"
+        )
 
-        if target_pos > self.pos:
-            buy_volume: int = int(target_pos - self.pos)
+        if target_pos > effective_pos:
+            buy_volume: int = int(target_pos - effective_pos)
             if buy_volume > 0:
                 self.write_log(f"买入开仓：数量={buy_volume}，价格={bar.close_price:.2f}，A股T+1模式下仅允许开多")
-                self.buy(bar.close_price, buy_volume)
+                vt_orderids: list[str] = self.buy(bar.close_price, buy_volume)
+                if vt_orderids:
+                    reserved_volume: float = buy_volume / len(vt_orderids)
+                    for vt_orderid in vt_orderids:
+                        self.active_buy_orders[vt_orderid] = reserved_volume
         elif target_pos < self.pos:
             sell_volume: int = int(self.pos - target_pos)
             if sell_volume > 0:
@@ -285,7 +327,13 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
     def on_order(self, order: OrderData) -> None:
         """订单更新回调。"""
-        pass
+        if order.direction == Direction.LONG and order.offset in {Offset.OPEN, Offset.NONE}:
+            if order.is_active():
+                self.active_buy_orders[order.vt_orderid] = max(
+                    float(order.volume - order.traded), 0.0
+                )
+            else:
+                self.active_buy_orders.pop(order.vt_orderid, None)
 
     def on_trade(self, trade: TradeData) -> None:
         """成交更新回调。"""
