@@ -43,6 +43,7 @@ class StopOrder:
     net: bool = False
     vt_orderids: list = field(default_factory=list)
     status: StopOrderStatus = StopOrderStatus.WAITING
+    mark: str = ""
 
 
 EVENT_CTA_LOG = "eCtaLog"

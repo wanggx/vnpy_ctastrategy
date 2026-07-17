@@ -172,7 +172,8 @@ class CtaTemplate(ABC):
         volume: float,
         stop: bool = False,
         lock: bool = False,
-        net: bool = False
+        net: bool = False,
+        mark: str = ""
     ) -> list:
         """
         Send buy order to open a long position.
@@ -184,7 +185,8 @@ class CtaTemplate(ABC):
             volume,
             stop,
             lock,
-            net
+            net,
+            mark
         )
 
     def sell(
@@ -193,7 +195,8 @@ class CtaTemplate(ABC):
         volume: float,
         stop: bool = False,
         lock: bool = False,
-        net: bool = False
+        net: bool = False,
+        mark: str = ""
     ) -> list:
         """
         Send sell order to close a long position.
@@ -205,7 +208,8 @@ class CtaTemplate(ABC):
             volume,
             stop,
             lock,
-            net
+            net,
+            mark
         )
 
     def short(
@@ -214,7 +218,8 @@ class CtaTemplate(ABC):
         volume: float,
         stop: bool = False,
         lock: bool = False,
-        net: bool = False
+        net: bool = False,
+        mark: str = ""
     ) -> list:
         """
         Send short order to open as short position.
@@ -230,7 +235,8 @@ class CtaTemplate(ABC):
             volume,
             stop,
             lock,
-            net
+            net,
+            mark
         )
 
     def cover(
@@ -239,7 +245,8 @@ class CtaTemplate(ABC):
         volume: float,
         stop: bool = False,
         lock: bool = False,
-        net: bool = False
+        net: bool = False,
+        mark: str = ""
     ) -> list:
         """
         Send cover order to close a short position.
@@ -255,7 +262,8 @@ class CtaTemplate(ABC):
             volume,
             stop,
             lock,
-            net
+            net,
+            mark
         )
 
     def send_order(
@@ -266,14 +274,15 @@ class CtaTemplate(ABC):
         volume: float,
         stop: bool = False,
         lock: bool = False,
-        net: bool = False
+        net: bool = False,
+        mark: str = ""
     ) -> list:
         """
         Send a new order.
         """
         if self.trading:
             vt_orderids: list = self.cta_engine.send_order(
-                self, direction, offset, price, volume, stop, lock, net
+                self, direction, offset, price, volume, stop, lock, net, mark
             )
             return vt_orderids
         else:
@@ -285,6 +294,12 @@ class CtaTemplate(ABC):
         """
         if self.trading:
             self.cta_engine.cancel_order(self, vt_orderid)
+
+    @staticmethod
+    def get_order_mark(order: OrderData) -> str:
+        """Return the trigger mark carried by an order."""
+        _, separator, mark = order.reference.partition(":")
+        return mark if separator else ""
 
     def cancel_all(self) -> None:
         """

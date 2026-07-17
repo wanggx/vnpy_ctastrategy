@@ -14,6 +14,13 @@ from vnpy_ctastrategy import (
     BarGenerator,
     ArrayManager,
 )
+from vnpy_ctastrategy.base import EngineType
+
+from .market_sentiment import (
+    MarketSentimentService,
+    MarketSentimentSnapshot,
+)
+from .talib_indicators import EmaMacdCalculator, MacdResult
 
 
 class BottomFrictionMacdStrategy(CtaTemplate):
@@ -26,6 +33,7 @@ class BottomFrictionMacdStrategy(CtaTemplate):
     3. 收盘价低于10日均线时，清仓。
     4. 亏损超过 5 点时，清仓。
     5. MACD 上穿 0 轴时，买入摩擦仓位；MACD 下穿 0 轴时，卖出摩擦仓位。
+    6. 下跌超过3500家且超过1/3板块偏弱时仓位减半；下跌超过4000家时清仓。
     """
 
     author = "Copilot"
@@ -43,6 +51,10 @@ class BottomFrictionMacdStrategy(CtaTemplate):
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
+    market_sentiment_enabled: bool = True
+    market_decline_reduce_threshold: int = 3500
+    market_decline_exit_threshold: int = 4000
+    sector_decline_ratio_threshold: float = 1 / 3
 
     fast_ma: float = 0.0
     slow_ma: float = 0.0
@@ -52,6 +64,13 @@ class BottomFrictionMacdStrategy(CtaTemplate):
     macd_hist: float = 0.0
     last_macd_hist: float = 0.0
     avg_price: float = 0.0
+    market_sentiment_score: float = 0.0
+    market_declining_count: int = 0
+    declining_sector_count: int = 0
+    valid_sector_count: int = 0
+    declining_sector_ratio: float = 0.0
+    sentiment_risk_level: int = 0
+    sentiment_target_pos: int = -1
 
     parameters = [
         "base_size",
@@ -62,6 +81,10 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         "stop_loss_points",
         "profit_take_points",
         "profit_take_min_points",
+        "market_sentiment_enabled",
+        "market_decline_reduce_threshold",
+        "market_decline_exit_threshold",
+        "sector_decline_ratio_threshold",
     ]
     variables = [
         "fast_ma",
@@ -72,6 +95,13 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         "macd_hist",
         "last_macd_hist",
         "avg_price",
+        "market_sentiment_score",
+        "market_declining_count",
+        "declining_sector_count",
+        "valid_sector_count",
+        "declining_sector_ratio",
+        "sentiment_risk_level",
+        "sentiment_target_pos",
     ]
 
     def __init__(
@@ -82,13 +112,24 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         setting: dict,
     ) -> None:
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.close_prices: list[float] = []
-        self.macd_values: list[float] = []
+        self.macd_calculator: EmaMacdCalculator = EmaMacdCalculator(
+            fast_period=self.macd_fast,
+            slow_period=self.macd_slow,
+            signal_period=self.macd_signal,
+        )
+        # 保留原属性，兼容现有派生策略和指标比较脚本。
+        self.close_prices: list[float] = (
+            self.macd_calculator.close_prices
+        )
+        self.macd_values: list[float] = (
+            self.macd_calculator.macd_values
+        )
         self.daily_close_prices: list[float] = []
         self.current_day: date | None = None
         self.day_close_price: float = 0.0
         self.macd_trading_day: date | None = None
         self.active_buy_orders: dict[str, float] = {}
+        self.sentiment_service: MarketSentimentService | None = None
 
     def on_init(self) -> None:
         """策略初始化。"""
@@ -97,8 +138,7 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.bg: BarGenerator = BarGenerator(self.on_bar)
         self.am: ArrayManager = ArrayManager()
 
-        self.close_prices = []
-        self.macd_values = []
+        self.macd_calculator.reset()
         self.daily_close_prices = []
         self.current_day = None
         self.day_close_price = 0.0
@@ -109,11 +149,34 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         self.signal_line = 0.0
         self.macd_hist = 0.0
         self.last_macd_hist = 0.0
+        self.market_sentiment_score = 0.0
+        self.market_declining_count = 0
+        self.declining_sector_count = 0
+        self.valid_sector_count = 0
+        self.declining_sector_ratio = 0.0
+        self.sentiment_risk_level = 0
+        self.sentiment_target_pos = -1
+
+        if (
+            self.market_sentiment_enabled
+            and self.get_engine_type() == EngineType.LIVE
+        ):
+            self.sentiment_service = (
+                MarketSentimentService.get_shared(
+                    name="a_share",
+                    refresh_interval=10,
+                    stale_after=30,
+                )
+            )
+        else:
+            self.sentiment_service = None
 
         self.load_bar(60)
 
     def on_start(self) -> None:
         """策略启动。"""
+        if self.sentiment_service is not None:
+            self.sentiment_service.start()
         self.write_log("策略启动")
         self.put_event()
 
@@ -155,31 +218,39 @@ class BottomFrictionMacdStrategy(CtaTemplate):
                 f"止损触发：均价={self.avg_price:.2f}，当前价={bar.close_price:.2f}，"
                 f"浮亏={self.avg_price - bar.close_price:.2f}，清空仓位"
             )
-            self._set_target_position(bar, 0)
+            self._set_target_position(bar, 0, "止损")
             self.put_event()
             return
 
         if bar.close_price < self.ma10:
             self.write_log(f"跌破10日线：价格={bar.close_price:.2f}，10日线={self.ma10:.2f}，清仓")
-            self._set_target_position(bar, 0)
+            self._set_target_position(bar, 0, "跌破10日线")
+            self.put_event()
+            return
+
+        if self._apply_market_sentiment_risk(bar):
             self.put_event()
             return
 
         if self.fast_ma > self.slow_ma:
             self.write_log("均线多头排列：3日线大于5日线，维持底仓")
-            self._set_target_position(bar, self.base_size)
+            self._set_target_position(bar, self.base_size, "均线多头排列，回到底仓")
             self.put_event()
             return
 
         if self.pos < self.base_size:
             self.write_log(f"当前仓位低于底仓：当前={self.pos}，目标={self.base_size}，补到底仓")
-            self._set_target_position(bar, self.base_size)
+            self._set_target_position(bar, self.base_size, "仓位低于底仓，补仓")
             self.put_event()
             return
 
         if macd_cross_up:
             self.write_log("MACD上穿零轴：加仓摩擦仓位")
-            self._set_target_position(bar, self.base_size + self.friction_size)
+            self._set_target_position(
+                bar,
+                self.base_size + self.friction_size,
+                "MACD上穿零轴"
+            )
         elif macd_cross_down:
             if self.pos > self.base_size and self.avg_price > 0:
                 current_profit: float = bar.close_price - self.avg_price
@@ -192,7 +263,11 @@ class BottomFrictionMacdStrategy(CtaTemplate):
                         f"MACD下穿零轴或浮盈达到目标：当前价={bar.close_price:.2f}，"
                         f"均价={self.avg_price:.2f}，浮盈={current_profit:.2f}，减仓摩擦仓位"
                     )
-                    self._set_target_position(bar, max(self.base_size, self.pos - self.friction_size))
+                    self._set_target_position(
+                        bar,
+                        max(self.base_size, self.pos - self.friction_size),
+                        "MACD下穿零轴，减摩擦仓"
+                    )
                 else:
                     self.write_log(
                         f"MACD下穿零轴但浮盈未达到目标：当前价={bar.close_price:.2f}，"
@@ -208,14 +283,117 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
         self.put_event()
 
+    def _apply_market_sentiment_risk(self, bar: BarData) -> bool:
+        """在普通交易信号前执行全市场和板块情绪风控。"""
+        if (
+            not self.market_sentiment_enabled
+            or self.sentiment_service is None
+        ):
+            return False
+
+        snapshot: MarketSentimentSnapshot = (
+            self.sentiment_service.get_latest()
+        )
+        if not snapshot.available:
+            if self.sentiment_risk_level:
+                self.write_log(
+                    f"市场情绪数据不可用，解除情绪仓位锁定："
+                    f"{snapshot.error or '快照过期'}"
+                )
+            self.sentiment_risk_level = 0
+            self.sentiment_target_pos = -1
+            return False
+
+        risk_level: int = self._evaluate_market_sentiment(snapshot)
+
+        if risk_level == 0:
+            if self.sentiment_risk_level:
+                self.write_log(
+                    "市场情绪风险解除，恢复执行原有底仓和MACD逻辑"
+                )
+            self.sentiment_risk_level = 0
+            self.sentiment_target_pos = -1
+            return False
+
+        if risk_level != self.sentiment_risk_level:
+            if risk_level == 2:
+                self.sentiment_target_pos = 0
+                self.write_log(
+                    f"市场极弱：下跌家数={self.market_declining_count}"
+                    f">{self.market_decline_exit_threshold}，清仓"
+                )
+            else:
+                self.sentiment_target_pos = max(
+                    0,
+                    int(self.pos / 2),
+                )
+                self.write_log(
+                    f"市场偏弱：下跌家数={self.market_declining_count}"
+                    f">{self.market_decline_reduce_threshold}，"
+                    f"下跌板块={self.declining_sector_count}/"
+                    f"{self.valid_sector_count}"
+                    f"（{self.declining_sector_ratio:.1%}），"
+                    f"仓位减半至{self.sentiment_target_pos}"
+                )
+            self.sentiment_risk_level = risk_level
+
+        mark: str = (
+            "市场超过4000家下跌，清仓"
+            if risk_level == 2
+            else "市场和板块偏弱，仓位减半"
+        )
+        self._set_target_position(
+            bar,
+            self.sentiment_target_pos,
+            mark,
+        )
+        return True
+
+    def _evaluate_market_sentiment(
+        self,
+        snapshot: MarketSentimentSnapshot,
+    ) -> int:
+        """更新情绪变量并返回风险级别：0正常、1减半、2清仓。"""
+        self.market_sentiment_score = snapshot.score
+        self.market_declining_count = snapshot.breadth.declining
+
+        sector_states = list(snapshot.sectors.values())
+        self.valid_sector_count = len(sector_states)
+        self.declining_sector_count = sum(
+            state.breadth.declining > state.breadth.advancing
+            for state in sector_states
+        )
+        if self.valid_sector_count:
+            self.declining_sector_ratio = (
+                self.declining_sector_count
+                / self.valid_sector_count
+            )
+        else:
+            self.declining_sector_ratio = 0.0
+
+        if (
+            self.market_declining_count
+            > self.market_decline_exit_threshold
+        ):
+            return 2
+
+        if (
+            self.market_declining_count
+            > self.market_decline_reduce_threshold
+            and self.declining_sector_ratio
+            > self.sector_decline_ratio_threshold
+        ):
+            return 1
+
+        return 0
+
     def _prepare_intraday_macd(self, bar: BarData) -> bool:
         """切换交易日并过滤 09:30 之前的无效分钟数据。"""
         trading_day: date = bar.datetime.date()
 
         if trading_day != self.macd_trading_day:
             self.macd_trading_day = trading_day
-            self.close_prices.clear()
-            self.macd_values.clear()
+            self.macd_calculator.reset()
             self.macd_line = 0.0
             self.signal_line = 0.0
             self.macd_hist = 0.0
@@ -256,48 +434,28 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         return float(np.mean(values))
 
     def _calc_macd(self, close_price: float) -> tuple[float, float, float]:
-        """基于最新 1 分钟收盘价计算 MACD。"""
-        self.close_prices.append(float(close_price))
-
-        if len(self.close_prices) < max(self.macd_fast, self.macd_slow):
+        """通过共享流式组件计算最新 1 分钟 MACD。"""
+        result: MacdResult = self.macd_calculator.update(close_price)
+        if not result.ready:
             self.write_log(
                 f"MACD计算来源=自定义代码，收盘价={close_price:.2f}，"
                 "MACD=0.000000，Signal=0.000000，Hist=0.000000（数据不足）"
             )
             return 0.0, 0.0, 0.0
 
-        ema_fast: float = self._ema(self.close_prices, self.macd_fast)
-        ema_slow: float = self._ema(self.close_prices, self.macd_slow)
-        macd_line: float = ema_fast - ema_slow
-
-        self.macd_values.append(macd_line)
-        if len(self.macd_values) < self.macd_signal:
-            signal_line: float = 0.0
-        else:
-            signal_line = self._ema(self.macd_values[-self.macd_signal:], self.macd_signal)
-
-        macd_hist: float = macd_line - signal_line
         self.write_log(
             f"MACD计算来源=自定义代码，收盘价={close_price:.2f}，"
-            f"MACD={macd_line:.6f}，Signal={signal_line:.6f}，Hist={macd_hist:.6f}"
+            f"MACD={result.macd:.6f}，Signal={result.signal:.6f}，"
+            f"Hist={result.histogram:.6f}"
         )
-        return macd_line, signal_line, macd_hist
+        return result.as_tuple()
 
-    def _ema(self, values: list[float], period: int) -> float:
-        """计算指数移动平均。"""
-        if not values:
-            return 0.0
-
-        if len(values) == 1:
-            return float(values[-1])
-
-        alpha: float = 2.0 / (period + 1)
-        ema: float = float(values[0])
-        for value in values[1:]:
-            ema = alpha * value + (1 - alpha) * ema
-        return ema
-
-    def _set_target_position(self, bar: BarData, target_pos: float) -> None:
+    def _set_target_position(
+        self,
+        bar: BarData,
+        target_pos: float,
+        mark: str = ""
+    ) -> None:
         """根据目标仓位调整多头持仓。"""
         max_pos: int = max(0, int(self.base_size)) + max(0, int(self.friction_size))
         target_pos = min(max_pos, max(0, int(target_pos)))
@@ -314,7 +472,11 @@ class BottomFrictionMacdStrategy(CtaTemplate):
             buy_volume: int = int(target_pos - effective_pos)
             if buy_volume > 0:
                 self.write_log(f"买入开仓：数量={buy_volume}，价格={bar.close_price:.2f}，A股T+1模式下仅允许开多")
-                vt_orderids: list[str] = self.buy(bar.close_price, buy_volume)
+                vt_orderids: list[str] = self.buy(
+                    bar.close_price,
+                    buy_volume,
+                    mark=mark
+                )
                 if vt_orderids:
                     reserved_volume: float = buy_volume / len(vt_orderids)
                     for vt_orderid in vt_orderids:
@@ -323,10 +485,14 @@ class BottomFrictionMacdStrategy(CtaTemplate):
             sell_volume: int = int(self.pos - target_pos)
             if sell_volume > 0:
                 self.write_log(f"卖出减仓/平仓：数量={sell_volume}，价格={bar.close_price:.2f}")
-                self.sell(bar.close_price, sell_volume)
+                self.sell(bar.close_price, sell_volume, mark=mark)
 
     def on_order(self, order: OrderData) -> None:
         """订单更新回调。"""
+        mark: str = self.get_order_mark(order)
+        if mark:
+            self.write_log(f"订单标注：{mark}，委托号={order.vt_orderid}")
+
         if order.direction == Direction.LONG and order.offset in {Offset.OPEN, Offset.NONE}:
             if order.is_active():
                 self.active_buy_orders[order.vt_orderid] = max(

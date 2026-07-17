@@ -88,6 +88,7 @@ class CtaEngine(BaseEngine):
 
         self.symbol_strategy_map: defaultdict = defaultdict(list)       # vt_symbol: strategy list
         self.orderid_strategy_map: dict = {}                            # vt_orderid: strategy
+        self.orderid_reference_map: dict[str, str] = {}                 # vt_orderid: reference
         self.strategy_orderid_map: defaultdict = defaultdict(set)       # strategy_name: orderid set
 
         self.stop_order_count: int = 0                                  # for generating stop_orderid
@@ -167,6 +168,12 @@ class CtaEngine(BaseEngine):
         """"""
         order: OrderData = event.data
 
+        # Some gateways omit the request reference in later order pushes.
+        order.reference = self.orderid_reference_map.get(
+            order.vt_orderid,
+            order.reference
+        )
+
         strategy: CtaTemplate | None = self.orderid_strategy_map.get(order.vt_orderid, None)
         if not strategy:
             return
@@ -196,11 +203,15 @@ class CtaEngine(BaseEngine):
                 datetime=order.datetime,        # type: ignore
                 status=STOP_STATUS_MAP[order.status],
                 vt_orderids=[order.vt_orderid],
+                mark=self.get_order_mark(order.reference),
             )
             self.call_strategy_func(strategy, strategy.on_stop_order, so)
 
         # Call strategy on_order function
         self.call_strategy_func(strategy, strategy.on_order, order)
+
+        if not order.is_active():
+            self.orderid_reference_map.pop(order.vt_orderid, None)
 
     def process_trade_event(self, event: Event) -> None:
         """"""
@@ -476,7 +487,8 @@ class CtaEngine(BaseEngine):
                     price,
                     stop_order.volume,
                     stop_order.lock,
-                    stop_order.net
+                    stop_order.net,
+                    stop_order.mark
                 )
 
                 # Update stop order status if placed successfully
@@ -509,7 +521,8 @@ class CtaEngine(BaseEngine):
         volume: float,
         type: OrderType,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """
         Send a new order to server.
@@ -523,7 +536,7 @@ class CtaEngine(BaseEngine):
             type=type,
             price=price,
             volume=volume,
-            reference=f"{APP_NAME}_{strategy.strategy_name}"
+            reference=self.create_order_reference(strategy, mark)
         )
 
         # Convert with offset converter
@@ -545,6 +558,7 @@ class CtaEngine(BaseEngine):
                 continue
 
             vt_orderids.append(vt_orderid)
+            self.orderid_reference_map[vt_orderid] = req.reference
 
             self.main_engine.update_order_request(req, vt_orderid, contract.gateway_name)
 
@@ -566,7 +580,8 @@ class CtaEngine(BaseEngine):
         price: float,
         volume: float,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """
         Send a limit order to server.
@@ -580,7 +595,8 @@ class CtaEngine(BaseEngine):
             volume,
             OrderType.LIMIT,
             lock,
-            net
+            net,
+            mark
         )
 
     def send_server_stop_order(
@@ -592,7 +608,8 @@ class CtaEngine(BaseEngine):
         price: float,
         volume: float,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """
         Send a stop order to server.
@@ -609,7 +626,8 @@ class CtaEngine(BaseEngine):
             volume,
             OrderType.STOP,
             lock,
-            net
+            net,
+            mark
         )
 
     def send_local_stop_order(
@@ -620,7 +638,8 @@ class CtaEngine(BaseEngine):
         price: float,
         volume: float,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """
         Create a new local stop order.
@@ -637,6 +656,7 @@ class CtaEngine(BaseEngine):
             stop_orderid=stop_orderid,
             strategy_name=strategy.strategy_name,
             datetime=datetime.now(DB_TZ),
+            mark=mark,
             lock=lock,
             net=net
         )
@@ -703,7 +723,8 @@ class CtaEngine(BaseEngine):
         volume: float,
         stop: bool,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """
         """
@@ -722,16 +743,30 @@ class CtaEngine(BaseEngine):
         if stop:
             if contract.stop_supported:
                 return self.send_server_stop_order(
-                    strategy, contract, direction, offset, price, volume, lock, net
+                    strategy, contract, direction, offset, price, volume, lock, net, mark
                 )
             else:
                 return self.send_local_stop_order(
-                    strategy, direction, offset, price, volume, lock, net
+                    strategy, direction, offset, price, volume, lock, net, mark
                 )
         else:
             return self.send_limit_order(
-                strategy, contract, direction, offset, price, volume, lock, net
+                strategy, contract, direction, offset, price, volume, lock, net, mark
             )
+
+    @staticmethod
+    def create_order_reference(strategy: CtaTemplate, mark: str) -> str:
+        """Create an order reference containing the strategy and trigger mark."""
+        reference: str = f"{APP_NAME}_{strategy.strategy_name}"
+        if mark:
+            reference = f"{reference}:{mark}"
+        return reference
+
+    @staticmethod
+    def get_order_mark(reference: str) -> str:
+        """Extract the trigger mark from an order reference."""
+        _, separator, mark = reference.partition(":")
+        return mark if separator else ""
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
         """

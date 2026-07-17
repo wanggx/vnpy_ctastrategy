@@ -32,6 +32,7 @@ from vnpy.trader.optimize import (
 )
 
 from .base import (
+    APP_NAME,
     BacktestingMode,
     EngineType,
     STOPORDER_PREFIX,
@@ -884,7 +885,8 @@ class BacktestingEngine:
                 traded=stop_order.volume,
                 status=Status.ALLTRADED,
                 gateway_name=self.gateway_name,
-                datetime=self.datetime
+                datetime=self.datetime,
+                reference=self.create_order_reference(stop_order.mark)
             )
 
             self.limit_orders[order.vt_orderid] = order
@@ -989,7 +991,8 @@ class BacktestingEngine:
         volume: float,
         stop: bool,
         lock: bool,
-        net: bool
+        net: bool,
+        mark: str = ""
     ) -> list:
         """"""
         price = round_to(price, self.pricetick)
@@ -998,9 +1001,9 @@ class BacktestingEngine:
             return []
 
         if stop:
-            vt_orderid: str = self.send_stop_order(direction, offset, price, volume)
+            vt_orderid: str = self.send_stop_order(direction, offset, price, volume, mark)
         else:
-            vt_orderid = self.send_limit_order(direction, offset, price, volume)
+            vt_orderid = self.send_limit_order(direction, offset, price, volume, mark)
         return [vt_orderid]
 
     def send_stop_order(
@@ -1008,7 +1011,8 @@ class BacktestingEngine:
         direction: Direction,
         offset: Offset,
         price: float,
-        volume: float
+        volume: float,
+        mark: str = ""
     ) -> str:
         """"""
         self.stop_order_count += 1
@@ -1022,6 +1026,7 @@ class BacktestingEngine:
             datetime=self.datetime,
             stop_orderid=f"{STOPORDER_PREFIX}.{self.stop_order_count}",
             strategy_name=self.strategy.strategy_name,
+            mark=mark,
         )
 
         self.active_stop_orders[stop_order.stop_orderid] = stop_order
@@ -1037,7 +1042,8 @@ class BacktestingEngine:
         direction: Direction,
         offset: Offset,
         price: float,
-        volume: float
+        volume: float,
+        mark: str = ""
     ) -> str:
         """"""
         self.limit_order_count += 1
@@ -1052,7 +1058,8 @@ class BacktestingEngine:
             volume=volume,
             status=Status.SUBMITTING,
             gateway_name=self.gateway_name,
-            datetime=self.datetime
+            datetime=self.datetime,
+            reference=self.create_order_reference(mark)
         )
 
         self.active_limit_orders[order.vt_orderid] = order
@@ -1062,6 +1069,13 @@ class BacktestingEngine:
             self.freeze_t1_sell(order.vt_orderid, volume)
 
         return order.vt_orderid
+
+    def create_order_reference(self, mark: str) -> str:
+        """Create an order reference containing the strategy and trigger mark."""
+        reference: str = f"{APP_NAME}_{self.strategy.strategy_name}"
+        if mark:
+            reference = f"{reference}:{mark}"
+        return reference
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
         """
