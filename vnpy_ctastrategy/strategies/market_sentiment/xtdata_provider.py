@@ -1,9 +1,8 @@
 """基于 xtquant.xtdata 的全市场实时行情数据提供模块。"""
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from threading import RLock
-from time import monotonic
 from types import ModuleType
 from typing import Any, Protocol, cast
 
@@ -53,8 +52,6 @@ class XtDataProvider:
         self,
         sectors: Sequence[str] = ("沪深A股",),
         index_symbols: Mapping[str, str] | None = None,
-        universe_cache_seconds: float = 3_600,
-        sector_cache_seconds: float = 21_600,
         batch_size: int = 1_000,
         sector_names: Sequence[str] | None = None,
         excluded_sectors: Sequence[str] = tuple(DEFAULT_EXCLUDED_SECTORS),
@@ -64,10 +61,6 @@ class XtDataProvider:
     ) -> None:
         if not sectors:
             raise ValueError("sectors 不能为空")
-        if universe_cache_seconds < 0:
-            raise ValueError("universe_cache_seconds 不能小于0")
-        if sector_cache_seconds < 0:
-            raise ValueError("sector_cache_seconds 不能小于0")
         if batch_size <= 0:
             raise ValueError("batch_size 必须大于0")
         if minimum_sector_size <= 0:
@@ -79,8 +72,6 @@ class XtDataProvider:
         self.index_symbols: dict[str, str] = dict(
             index_symbols or DEFAULT_INDEX_SYMBOLS
         )
-        self.universe_cache_seconds: float = universe_cache_seconds
-        self.sector_cache_seconds: float = sector_cache_seconds
         self.batch_size: int = batch_size
         self.sector_names: tuple[str, ...] | None = (
             tuple(sector_names) if sector_names is not None else None
@@ -92,17 +83,17 @@ class XtDataProvider:
 
         self._lock: RLock = RLock()
         self._stock_universe: tuple[str, ...] = ()
-        self._universe_updated_at: float = 0.0
+        self._universe_updated_on: date | None = None
         self._sector_members: dict[str, tuple[str, ...]] = {}
-        self._sectors_updated_at: float = 0.0
+        self._sectors_updated_on: date | None = None
 
     def get_stock_universe(self, force: bool = False) -> tuple[str, ...]:
-        """获取沪深A股代码，并按配置的缓存时间复用。"""
+        """获取沪深A股代码，同一个本地日期只访问一次 QMT。"""
         with self._lock:
+            today: date = datetime.now().astimezone().date()
             cache_valid: bool = (
                 bool(self._stock_universe)
-                and monotonic() - self._universe_updated_at
-                < self.universe_cache_seconds
+                and self._universe_updated_on == today
             )
             if cache_valid and not force:
                 return self._stock_universe
@@ -125,9 +116,9 @@ class XtDataProvider:
                 )
 
             self._stock_universe = tuple(sorted(symbols))
-            self._universe_updated_at = monotonic()
-            if force:
-                self._sectors_updated_at = 0.0
+            self._universe_updated_on = today
+            # 股票池发生刷新后，板块成员必须基于新股票池重新生成。
+            self._sectors_updated_on = None
             return self._stock_universe
 
     def get_full_snapshot(
@@ -187,10 +178,9 @@ class XtDataProvider:
     ) -> dict[str, tuple[str, ...]]:
         """获取 QMT 板块成员；同一股票可以属于多个板块。"""
         with self._lock:
+            today: date = datetime.now().astimezone().date()
             cache_valid: bool = (
-                self._sectors_updated_at > 0
-                and monotonic() - self._sectors_updated_at
-                < self.sector_cache_seconds
+                self._sectors_updated_on == today
             )
             if cache_valid and not force:
                 return dict(self._sector_members)
@@ -224,7 +214,7 @@ class XtDataProvider:
                     sector_members[name] = members
 
             self._sector_members = sector_members
-            self._sectors_updated_at = monotonic()
+            self._sectors_updated_on = today
             return dict(sector_members)
 
     def refresh_sectors(self) -> dict[str, tuple[str, ...]]:

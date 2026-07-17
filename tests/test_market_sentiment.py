@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import unittest
 
 from vnpy_ctastrategy.strategies.market_sentiment import (
@@ -91,7 +91,6 @@ class MarketSentimentTest(unittest.TestCase):
         provider = XtDataProvider(
             client=client,
             batch_size=2,
-            universe_cache_seconds=3_600,
             minimum_sector_size=1,
         )
 
@@ -111,6 +110,21 @@ class MarketSentimentTest(unittest.TestCase):
 
         provider.get_full_snapshot()
         self.assertEqual(client.sector_calls, 2)
+
+        provider._sectors_updated_on = (  # noqa: SLF001
+            datetime.now().astimezone().date() - timedelta(days=1)
+        )
+        provider.get_full_snapshot()
+        self.assertEqual(client.sector_calls, 3)
+
+        provider._universe_updated_on = (  # noqa: SLF001
+            datetime.now().astimezone().date() - timedelta(days=1)
+        )
+        provider.get_full_snapshot()
+        self.assertEqual(client.sector_calls, 5)
+
+        provider.refresh_sectors()
+        self.assertEqual(client.sector_calls, 6)
 
     def test_breadth_index_and_sentiment(self) -> None:
         now = datetime.now().astimezone()
