@@ -431,6 +431,10 @@ msgstr ""
 msgid "策略名"
 msgstr ""
 
+#: vnpy_ctastrategy\ui\widget.py:401
+msgid "标注"
+msgstr ""
+
 #: vnpy_ctastrategy\ui\widget.py:419
 msgid "信息"
 msgstr ""
