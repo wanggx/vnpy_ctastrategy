@@ -1241,3 +1241,16 @@ class CtaEngine(BaseEngine):
             subject = _("CTA策略引擎")
 
         self.main_engine.send_email(subject, msg, None)
+
+    def send_wecom(self, msg: str, strategy: CtaTemplate | None = None) -> None:
+        """
+        Send message through WeCom.
+        """
+        if strategy:
+            subject: str = f"{strategy.strategy_name}"
+        else:
+            subject = _("CTA策略引擎")
+
+        wecom_engine: Any = self.main_engine.get_engine("wecom")
+        if wecom_engine:
+            wecom_engine.send_wecom(f"{subject}\n{msg}")

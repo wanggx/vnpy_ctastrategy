@@ -1131,6 +1131,12 @@ class BacktestingEngine:
         """
         pass
 
+    def send_wecom(self, msg: str, strategy: CtaTemplate | None = None) -> None:
+        """
+        Do not send WeCom messages during backtesting.
+        """
+        pass
+
     def sync_strategy_data(self, strategy: CtaTemplate) -> None:
         """
         Sync strategy data into json file.

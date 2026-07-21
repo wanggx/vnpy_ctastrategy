@@ -379,6 +379,13 @@ class CtaTemplate(ABC):
         if self.inited:
             self.cta_engine.send_email(msg, self)
 
+    def send_wecom(self, msg: str) -> None:
+        """
+        Send message through WeCom.
+        """
+        if self.inited:
+            self.cta_engine.send_wecom(msg, self)
+
     def sync_data(self) -> None:
         """
         Sync strategy variables value into disk storage.
