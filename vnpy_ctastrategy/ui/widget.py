@@ -396,6 +396,7 @@ class StopOrderMonitor(BaseMonitor):
         "lock": {"display": _("锁仓"), "cell": BaseCell, "update": False},
         "net": {"display": _("净仓"), "cell": BaseCell, "update": False},
         "strategy_name": {"display": _("策略名"), "cell": BaseCell, "update": False},
+        "mark": {"display": _("标注"), "cell": BaseCell, "update": False},
     }
 
     def __del__(self) -> None:
