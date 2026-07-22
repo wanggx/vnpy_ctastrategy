@@ -964,7 +964,11 @@ class CtaEngine(BaseEngine):
         contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
         if contract:
             req: SubscribeRequest = SubscribeRequest(
-                symbol=contract.symbol, exchange=contract.exchange)
+                symbol=contract.symbol,
+                exchange=contract.exchange,
+                app_name=APP_NAME,
+                subscriber_name=strategy.strategy_name
+            )
             self.main_engine.subscribe(req, contract.gateway_name)
         else:
             self.write_log(_("行情订阅失败，找不到合约{}").format(strategy.vt_symbol), strategy)
@@ -1036,6 +1040,16 @@ class CtaEngine(BaseEngine):
         if strategy.trading:
             self.write_log(_("策略{}移除失败，请先停止").format(strategy.strategy_name))
             return False
+
+        contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
+        if contract:
+            req: SubscribeRequest = SubscribeRequest(
+                symbol=contract.symbol,
+                exchange=contract.exchange,
+                app_name=APP_NAME,
+                subscriber_name=strategy.strategy_name
+            )
+            self.main_engine.unsubscribe(req, contract.gateway_name)
 
         # Remove setting
         self.remove_strategy_setting(strategy_name)
