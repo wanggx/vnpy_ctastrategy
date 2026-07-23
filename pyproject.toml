@@ -25,6 +25,13 @@ dependencies = [
     "pandas",
     "plotly",
 ]
+
+[project.optional-dependencies]
+mysql = [
+    "SQLAlchemy>=2.0",
+    "PyMySQL>=1.1",
+]
+
 keywords = ["quant", "quantitative", "investment", "trading", "algotrading"]
 
 [project.urls]
@@ -82,4 +89,4 @@ strict_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
-ignore_missing_imports = true 
+ignore_missing_imports = true

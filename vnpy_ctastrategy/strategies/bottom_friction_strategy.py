@@ -5,7 +5,6 @@ import numpy as np
 from vnpy.trader.constant import Direction, Offset
 
 from vnpy_ctastrategy import (
-    CtaTemplate,
     StopOrder,
     TickData,
     BarData,
@@ -16,6 +15,7 @@ from vnpy_ctastrategy import (
 )
 from vnpy_ctastrategy.base import EngineType
 
+from .base import CtaTemplateService
 from .market_sentiment import (
     MarketSentimentService,
     MarketSentimentSnapshot,
@@ -23,7 +23,7 @@ from .market_sentiment import (
 from .talib_indicators import EmaMacdCalculator, MacdResult
 
 
-class BottomFrictionStrategy(CtaTemplate):
+class BottomFrictionStrategy(CtaTemplateService):
     """
     底仓 + 摩擦仓位 + MACD 盘中做 T 的 1 分钟 CTA 策略。
 
