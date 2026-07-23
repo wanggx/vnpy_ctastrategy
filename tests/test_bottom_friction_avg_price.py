@@ -4,7 +4,7 @@ import unittest
 from vnpy.trader.constant import Direction, Exchange, Offset, Status
 from vnpy.trader.object import OrderData, TickData, TradeData
 
-from vnpy_ctastrategy.strategies.bottom_friction_macd_strategy import (
+from vnpy_ctastrategy.strategies.bottom_friction_strategy import (
     BottomFrictionMacdStrategy,
 )
 
@@ -81,7 +81,7 @@ class BottomFrictionAvgPriceTest(unittest.TestCase):
         self.assertEqual(self.strategy.avg_price, 0)
         self.assertIn("avg_price", self.strategy.variables)
         self.assertIn("pos_avg_price", self.strategy.variables)
-        self.assertIn("shares_per_lot", self.strategy.parameters)
+        self.assertNotIn("shares_per_lot", self.strategy.parameters)
 
     def test_order_and_trade_send_wecom_messages(self) -> None:
         self.strategy.inited = True

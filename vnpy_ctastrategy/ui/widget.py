@@ -164,7 +164,14 @@ class CtaManager(QtWidgets.QWidget):
             return
 
         parameters: dict = self.cta_engine.get_strategy_class_parameters(class_name)
-        editor: SettingEditor = SettingEditor(parameters, class_name=class_name)
+        parameter_labels: dict = (
+            self.cta_engine.get_strategy_class_parameter_labels(class_name)
+        )
+        editor: SettingEditor = SettingEditor(
+            parameters,
+            class_name=class_name,
+            parameter_labels=parameter_labels,
+        )
         n: int = editor.exec_()
 
         if n == editor.DialogCode.Accepted:
@@ -243,6 +250,12 @@ class StrategyManager(QtWidgets.QFrame):
         vt_symbol: str = self._data["vt_symbol"]
         class_name: str = self._data["class_name"]
         author: str = self._data["author"]
+        self.parameter_labels: dict = (
+            self.cta_engine.get_strategy_class_parameter_labels(class_name)
+        )
+        self.variable_labels: dict = (
+            self.cta_engine.get_strategy_class_variable_labels(class_name)
+        )
 
         label_text: str = (
             f"{strategy_name}  -  {vt_symbol}  ({class_name} by {author})"
@@ -250,8 +263,14 @@ class StrategyManager(QtWidgets.QFrame):
         label: QtWidgets.QLabel = QtWidgets.QLabel(label_text)
         label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
-        self.parameters_monitor: DataMonitor = DataMonitor(self._data["parameters"])
-        self.variables_monitor: DataMonitor = DataMonitor(self._data["variables"])
+        self.parameters_monitor: DataMonitor = DataMonitor(
+            self._data["parameters"],
+            self.parameter_labels,
+        )
+        self.variables_monitor: DataMonitor = DataMonitor(
+            self._data["variables"],
+            self.variable_labels,
+        )
 
         hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox.addWidget(self.init_button)
@@ -311,7 +330,11 @@ class StrategyManager(QtWidgets.QFrame):
         strategy_name: str = self._data["strategy_name"]
 
         parameters: dict = self.cta_engine.get_strategy_parameters(strategy_name)
-        editor: SettingEditor = SettingEditor(parameters, strategy_name=strategy_name)
+        editor: SettingEditor = SettingEditor(
+            parameters,
+            strategy_name=strategy_name,
+            parameter_labels=self.parameter_labels,
+        )
         n: int = editor.exec_()
 
         if n == editor.DialogCode.Accepted:
@@ -332,18 +355,22 @@ class DataMonitor(QtWidgets.QTableWidget):
     Table monitor for parameters and variables.
     """
 
-    def __init__(self, data: dict) -> None:
+    def __init__(self, data: dict, name_labels: dict | None = None) -> None:
         """"""
         super().__init__()
 
         self._data: dict = data
+        self.name_labels: dict = name_labels or {}
         self.cells: dict = {}
 
         self.init_ui()
 
     def init_ui(self) -> None:
         """"""
-        labels: list = list(self._data.keys())
+        labels: list = [
+            self.name_labels.get(name, name)
+            for name in self._data.keys()
+        ]
         self.setColumnCount(len(labels))
         self.setHorizontalHeaderLabels(labels)
 
@@ -442,12 +469,17 @@ class SettingEditor(QtWidgets.QDialog):
     """
 
     def __init__(
-        self, parameters: dict, strategy_name: str = "", class_name: str = ""
+        self,
+        parameters: dict,
+        strategy_name: str = "",
+        class_name: str = "",
+        parameter_labels: dict | None = None,
     ) -> None:
         """"""
         super().__init__()
 
         self.parameters: dict = parameters
+        self.parameter_labels: dict = parameter_labels or {}
         self.strategy_name: str = strategy_name
         self.class_name: str = class_name
 
@@ -481,7 +513,8 @@ class SettingEditor(QtWidgets.QDialog):
                 double_validator: QtGui.QDoubleValidator = QtGui.QDoubleValidator()
                 edit.setValidator(double_validator)
 
-            form.addRow(f"{name} {type_}", edit)
+            label: str = self.parameter_labels.get(name, name)
+            form.addRow(f"{label} {type_}", edit)
 
             self.edits[name] = (edit, type_)
 

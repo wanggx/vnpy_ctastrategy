@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vnpy_ctastrategy.strategies.bottom_friction_macd_strategy import (  # noqa: E402
+from vnpy_ctastrategy.strategies.bottom_friction_strategy import (  # noqa: E402
     BottomFrictionMacdStrategy,
 )
 from vnpy_ctastrategy.strategies.bottom_friction_talib_macd_strategy import (  # noqa: E402

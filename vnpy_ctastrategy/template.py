@@ -14,7 +14,18 @@ class CtaTemplate(ABC):
 
     author: str = ""
     parameters: list = ["t1"]
+    parameter_labels: dict[str, str] = {}
     variables: list = []
+    variable_labels: dict[str, str] = {
+        "inited": "已初始化",
+        "trading": "交易中",
+        "pos": "持仓",
+        "yd_pos": "昨仓",
+        "td_pos": "今仓",
+        "local_sell_frozen": "卖出冻结",
+        "position_synced": "持仓同步",
+        "position_sync_time": "同步时间",
+    }
     t1: bool = False
 
     def __init__(
@@ -84,6 +95,26 @@ class CtaTemplate(ABC):
         if "t1" not in parameters:
             parameters.insert(0, "t1")
         return parameters
+
+    @classmethod
+    def get_class_parameter_labels(cls) -> dict[str, str]:
+        """
+        Get display labels for strategy parameters.
+        """
+        return {
+            name: cls.parameter_labels.get(name, name)
+            for name in cls.get_class_parameter_names()
+        }
+
+    @classmethod
+    def get_class_variable_labels(cls) -> dict[str, str]:
+        """
+        Get display labels for strategy variables.
+        """
+        labels: dict[str, str] = {}
+        for base in reversed(cls.__mro__):
+            labels.update(base.__dict__.get("variable_labels", {}))
+        return labels
 
     def get_parameters(self) -> dict:
         """

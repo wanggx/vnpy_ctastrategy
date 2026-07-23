@@ -1151,6 +1151,20 @@ class CtaEngine(BaseEngine):
 
         return parameters
 
+    def get_strategy_class_parameter_labels(self, class_name: str) -> dict[str, str]:
+        """
+        Get display labels of parameters for a strategy class.
+        """
+        strategy_class: type[CtaTemplate] = self.classes[class_name]
+        return strategy_class.get_class_parameter_labels()
+
+    def get_strategy_class_variable_labels(self, class_name: str) -> dict[str, str]:
+        """
+        Get display labels of variables for a strategy class.
+        """
+        strategy_class: type[CtaTemplate] = self.classes[class_name]
+        return strategy_class.get_class_variable_labels()
+
     def get_strategy_parameters(self, strategy_name: str) -> dict:
         """
         Get parameters of a strategy.

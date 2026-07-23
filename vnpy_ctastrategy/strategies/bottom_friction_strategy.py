@@ -23,7 +23,7 @@ from .market_sentiment import (
 from .talib_indicators import EmaMacdCalculator, MacdResult
 
 
-class BottomFrictionMacdStrategy(CtaTemplate):
+class BottomFrictionStrategy(CtaTemplate):
     """
     底仓 + 摩擦仓位 + MACD 盘中做 T 的 1 分钟 CTA 策略。
 
@@ -40,8 +40,8 @@ class BottomFrictionMacdStrategy(CtaTemplate):
 
     t1: bool = True
 
-    base_size: int = 100
-    friction_size: int = 50
+    base_size: int = 1000
+    friction_size: int = 500
     fast_window: int = 3
     slow_window: int = 5
     ma10_window: int = 10
@@ -83,12 +83,26 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         "stop_loss_points",
         "profit_take_points",
         "profit_take_min_points",
-        "shares_per_lot",
         "market_sentiment_enabled",
         "market_decline_reduce_threshold",
         "market_decline_exit_threshold",
         "sector_decline_ratio_threshold",
     ]
+    parameter_labels = {
+        "t1": "T+1",
+        "base_size": "底仓",
+        "friction_size": "T仓",
+        "fast_window": "快线",
+        "slow_window": "慢线",
+        "ma10_window": "清仓均线",
+        "stop_loss_points": "止损",
+        "profit_take_points": "止盈",
+        "profit_take_min_points": "最低止盈",
+        "market_sentiment_enabled": "情绪开关",
+        "market_decline_reduce_threshold": "大盘减仓数",
+        "market_decline_exit_threshold": "大盘清仓数",
+        "sector_decline_ratio_threshold": "板块弱势比",
+    }
     variables = [
         "fast_ma",
         "slow_ma",
@@ -107,6 +121,24 @@ class BottomFrictionMacdStrategy(CtaTemplate):
         "sentiment_risk_level",
         "sentiment_target_pos",
     ]
+    variable_labels = {
+        "fast_ma": "快线值",
+        "slow_ma": "慢线值",
+        "ma10": "清仓线值",
+        "macd_line": "MACD",
+        "signal_line": "信号线",
+        "macd_hist": "MACD柱",
+        "last_macd_hist": "前MACD柱",
+        "avg_price": "均价",
+        "pos_avg_price": "持仓均价",
+        "market_sentiment_score": "情绪分",
+        "market_declining_count": "下跌家数",
+        "declining_sector_count": "弱势板块数",
+        "valid_sector_count": "有效板块数",
+        "declining_sector_ratio": "弱势板块比",
+        "sentiment_risk_level": "情绪风险",
+        "sentiment_target_pos": "情绪目标仓",
+    }
 
     def __init__(
         self,

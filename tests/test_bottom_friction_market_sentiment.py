@@ -4,7 +4,7 @@ import unittest
 from vnpy.trader.constant import Direction, Exchange, Interval, Offset
 from vnpy.trader.object import BarData
 
-from vnpy_ctastrategy.strategies.bottom_friction_macd_strategy import (
+from vnpy_ctastrategy.strategies.bottom_friction_strategy import (
     BottomFrictionMacdStrategy,
 )
 from vnpy_ctastrategy.strategies.market_sentiment import (
