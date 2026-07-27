@@ -65,22 +65,27 @@ class IndexState:
 
 @dataclass(frozen=True, slots=True)
 class MarketBreadth:
-    """全市场上涨、下跌和收益分布统计。"""
+    """全市场上涨、下跌和收益分布统计。
 
-    universe_size: int = 0
-    valid_count: int = 0
-    advancing: int = 0
-    declining: int = 0
-    unchanged: int = 0
-    invalid_count: int = 0
-    limit_up: int = 0
-    limit_down: int = 0
-    advance_ratio: float = 0.0
-    decline_ratio: float = 0.0
-    net_advance_ratio: float = 0.0
-    advance_decline_ratio: float = 0.0
-    average_change_percent: float = 0.0
-    median_change_percent: float = 0.0
+    家数类字段的涨跌判定由 MarketBreadthCalculator 的阈值决定，默认：
+    平盘 epsilon = 0.001%（涨幅绝对值 <= 该阈值视为平盘），
+    涨跌停阈值 = 9.5%（涨幅 >= 视为涨停，<= -阈值视为跌停）。
+    """
+
+    universe_size: int = 0  # 股票池标的总数，含无有效行情的标的
+    valid_count: int = 0  # 有有效 Tick、可统计涨跌幅的标的数
+    advancing: int = 0  # 上涨家数（涨幅 > 0.001%）
+    declining: int = 0  # 下跌家数（涨幅 < -0.001%）
+    unchanged: int = 0  # 平盘家数（涨幅落在 ±0.001% 之间）
+    invalid_count: int = 0  # Tick 缺失或价格无效的标的数
+    limit_up: int = 0  # 涨停家数（涨幅 >= 9.5%）
+    limit_down: int = 0  # 跌停家数（涨幅 <= -9.5%）
+    advance_ratio: float = 0.0  # 上涨占比 = advancing / valid_count
+    decline_ratio: float = 0.0  # 下跌占比 = declining / valid_count
+    net_advance_ratio: float = 0.0  # 净涨跌占比 = (advancing - declining) / valid_count，取值 [-1, 1]
+    advance_decline_ratio: float = 0.0  # 涨跌家数比 = advancing / declining；无下跌时退化为 advancing 裸值，非比值
+    average_change_percent: float = 0.0  # 有效标的涨跌幅算术平均，单位 %
+    median_change_percent: float = 0.0  # 有效标的涨跌幅中位数，单位 %
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,19 +100,26 @@ class SectorState:
 
 @dataclass(frozen=True, slots=True)
 class MarketSentimentSnapshot:
-    """供多个 CTA 策略共享读取的市场情绪快照。"""
+    """供多个 CTA 策略共享读取的市场情绪快照。
 
-    datetime: datetime
-    score: float
-    level: SentimentLevel
-    breadth: MarketBreadth
-    indices: dict[str, IndexState] = field(default_factory=dict)
-    sectors: dict[str, SectorState] = field(default_factory=dict)
-    stock_sectors: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    sector_score: float = 0.0
-    source_count: int = 0
-    stale: bool = False
-    error: str = ""
+    score 由 SentimentCalculator 合成：宽度(权重0.55)、指数(0.30)、板块(0.15)
+    加权（权重归一，缺项按可用权重降级）；宽度分=净涨跌占比分*0.75+平均涨幅分*0.25，
+    指数分=有效指数平均涨幅映射，板块分=最强3个板块均值。level 由 score 经 classify
+    映射：<20 极弱 / <40 偏弱 / <60 中性 / <80 偏强 / >=80 极强，有效标的不足时为
+    不可用。stale/error 反映缓存新鲜度与降级/异常状态。
+    """
+
+    datetime: datetime  # 快照所基于的行情时间（数据提供器返回），非策略读取时刻
+    score: float  # 0~100 综合情绪分，见类说明；有效标的不足时为 0.0
+    level: SentimentLevel  # 情绪分级，由 score 经 classify 映射；有效标的不足时为 UNAVAILABLE
+    breadth: MarketBreadth  # 全市场宽度统计（涨跌家数、涨跌停、涨跌幅分布等）
+    indices: dict[str, IndexState] = field(default_factory=dict)  # 主要指数状态，键为指数代码，含缺失/无效项(valid=False)
+    sectors: dict[str, SectorState] = field(default_factory=dict)  # 板块状态，键为板块名，仅含有效标的数达阈值(默认5)的板块
+    stock_sectors: dict[str, tuple[str, ...]] = field(default_factory=dict)  # 股票到板块的反向多对多映射，键为股票代码，值为所属板块名元组(已排序)
+    sector_score: float = 0.0  # 参与总分计算的板块分=最强3个板块 score 的均值；无板块时为 0.0
+    source_count: int = 0  # 数据提供器返回的 Tick 总数，反映本次采样覆盖面
+    stale: bool = False  # 缓存是否过期（距上次成功刷新或行情时间超过 stale_after，默认30s），策略据此判断是否信任本快照
+    error: str = ""  # 降级/异常提示：正常为空；缺指数或板块时降级提示；刷新抛异常时为异常信息；首次刷新前为占位提示
 
     @property
     def available(self) -> bool:

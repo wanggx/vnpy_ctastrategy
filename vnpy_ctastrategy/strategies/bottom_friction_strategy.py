@@ -64,6 +64,8 @@ class BottomFrictionStrategy(CtaTemplateService):
     signal_line: float = 0.0
     macd_hist: float = 0.0
     last_macd_hist: float = 0.0
+    fast_slow_ma: str = ""
+    macd_triple: str = ""
     avg_price: float = 0.0
     pos_avg_price: float = 0.0
     market_sentiment_score: float = 0.0
@@ -104,12 +106,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "sector_decline_ratio_threshold": "板块弱势比",
     }
     variables = [
-        "fast_ma",
-        "slow_ma",
+        "fast_slow_ma",
         "ma10",
-        "macd_line",
-        "signal_line",
-        "macd_hist",
+        "macd_triple",
         "last_macd_hist",
         "avg_price",
         "pos_avg_price",
@@ -122,12 +121,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "sentiment_target_pos",
     ]
     variable_labels = {
-        "fast_ma": "快线值",
-        "slow_ma": "慢线值",
+        "fast_slow_ma": "快慢线值",
         "ma10": "清仓线值",
-        "macd_line": "MACD",
-        "signal_line": "信号线",
-        "macd_hist": "MACD柱",
+        "macd_triple": "MACD",
         "last_macd_hist": "前MACD柱",
         "avg_price": "均价",
         "pos_avg_price": "持仓均价",
@@ -186,6 +182,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.signal_line = 0.0
         self.macd_hist = 0.0
         self.last_macd_hist = 0.0
+        self.fast_slow_ma = ""
+        self.macd_triple = ""
         self.market_sentiment_score = 0.0
         self.market_declining_count = 0
         self.declining_sector_count = 0
@@ -256,18 +254,23 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.macd_line, self.signal_line, self.macd_hist = self._calc_macd(bar.close_price)
         self.last_macd_hist = prev_macd_hist
 
+        self.fast_slow_ma = f"{self.fast_ma}/{self.slow_ma}"
+        self.macd_triple = f"{self.macd_line}/{self.signal_line}/{self.macd_hist}"
+
         macd_cross_up: bool = prev_macd_hist <= 0 and self.macd_hist > 0
         macd_cross_down: bool = prev_macd_hist >= 0 and self.macd_hist < 0
 
-        current_loss: float = round(self.pos_avg_price - bar.close_price, 2)
-        if (
-            self.pos > 0
-            and self.pos_avg_price > 0
-            and current_loss > self.stop_loss_points
-        ):
-            self._set_target_position(bar, 0, "止损")
-            self.put_event()
-            return
+        if self.pos > 0 and self.pos_avg_price > 0:
+            current_loss: float = round(
+                (self.pos_avg_price - bar.close_price)
+                / self.pos_avg_price
+                * 100,
+                2,
+            )
+            if current_loss > self.stop_loss_points:
+                self._set_target_position(bar, 0, "止损")
+                self.put_event()
+                return
 
         if bar.close_price < self.ma10:
             self._set_target_position(bar, 0, "跌破10日线")
@@ -297,7 +300,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         elif macd_cross_down:
             if self.pos > self.base_size and self.pos_avg_price > 0:
                 current_profit: float = round(
-                    bar.close_price - self.pos_avg_price,
+                    (bar.close_price - self.pos_avg_price)
+                    / self.pos_avg_price
+                    * 100,
                     2,
                 )
                 should_reduce: bool = (
