@@ -34,6 +34,7 @@ class BottomFrictionStrategy(CtaTemplateService):
     4. 亏损超过 5 点时，清仓。
     5. MACD 上穿 0 轴时，买入摩擦仓位；MACD 下穿 0 轴时，卖出摩擦仓位。
     6. 下跌超过3500家且超过1/3板块偏弱时仓位减半；下跌超过4000家时清仓。
+    7. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
     """
 
     author = "Copilot"
@@ -48,6 +49,7 @@ class BottomFrictionStrategy(CtaTemplateService):
     stop_loss_points: float = 5.0
     profit_take_points: float = 3.0
     profit_take_min_points: float = 2.0
+    friction_take_profit_points: float = 2.0
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
@@ -68,6 +70,7 @@ class BottomFrictionStrategy(CtaTemplateService):
     macd_triple: str = ""
     avg_price: float = 0.0
     pos_avg_price: float = 0.0
+    friction_entry_price: float = 0.0
     market_sentiment_score: float = 0.0
     market_declining_count: int = 0
     declining_sector_count: int = 0
@@ -85,6 +88,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "stop_loss_points",
         "profit_take_points",
         "profit_take_min_points",
+        "friction_take_profit_points",
         "market_sentiment_enabled",
         "market_decline_reduce_threshold",
         "market_decline_exit_threshold",
@@ -100,6 +104,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "stop_loss_points": "止损",
         "profit_take_points": "止盈",
         "profit_take_min_points": "最低止盈",
+        "friction_take_profit_points": "摩擦止盈",
         "market_sentiment_enabled": "情绪开关",
         "market_decline_reduce_threshold": "大盘减仓数",
         "market_decline_exit_threshold": "大盘清仓数",
@@ -112,6 +117,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "last_macd_hist",
         "avg_price",
         "pos_avg_price",
+        "friction_entry_price",
         "market_sentiment_score",
         "market_declining_count",
         "declining_sector_count",
@@ -127,6 +133,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "last_macd_hist": "前MACD柱",
         "avg_price": "均价",
         "pos_avg_price": "持仓均价",
+        "friction_entry_price": "摩擦入场价",
         "market_sentiment_score": "情绪分",
         "market_declining_count": "下跌家数",
         "declining_sector_count": "弱势板块数",
@@ -162,6 +169,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.macd_trading_day: date | None = None
         self.avg_trading_day: date | None = None
         self.active_buy_orders: dict[str, float] = {}
+        self.friction_tp_pending: bool = False
         self.sentiment_service: MarketSentimentService | None = None
 
     def on_init(self) -> None:
@@ -176,8 +184,10 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.macd_trading_day = None
         self.avg_trading_day = None
         self.active_buy_orders.clear()
+        self.friction_tp_pending = False
         self.avg_price = 0.0
         self.pos_avg_price = 0.0
+        self.friction_entry_price = 0.0
         self.macd_line = 0.0
         self.signal_line = 0.0
         self.macd_hist = 0.0
@@ -232,6 +242,41 @@ class BottomFrictionStrategy(CtaTemplateService):
                 float(tick.turnover / (tick.volume * self.shares_per_lot)),
                 2,
             )
+
+        self._check_friction_take_profit(tick)
+
+    def _check_friction_take_profit(self, tick: TickData) -> None:
+        """价格涨到摩擦入场价+止盈点数时，到价卖出摩擦仓回到底仓。"""
+        if (
+            self.friction_entry_price <= 0
+            or self.friction_tp_pending
+            or self.pos <= self.base_size
+        ):
+            return
+
+        target_price: float = round(
+            self.friction_entry_price
+            * (1 + self.friction_take_profit_points / 100),
+            2,
+        )
+        if tick.last_price < target_price:
+            return
+
+        available: float = max(self.yd_pos - self.local_sell_frozen, 0)
+        sell_volume: int = int(min(self.pos - self.base_size, available))
+        if sell_volume <= 0:
+            return
+
+        sell_price: float = (
+            tick.bid_price_1 if tick.bid_price_1 > 0 else tick.last_price
+        )
+        vt_orderids: list[str] = self.sell(
+            sell_price,
+            sell_volume,
+            mark="摩擦仓止盈"
+        )
+        if vt_orderids:
+            self.friction_tp_pending = True
 
     def on_bar(self, bar: BarData) -> None:
         """收到 1 分钟 K 线时执行。"""
@@ -297,6 +342,7 @@ class BottomFrictionStrategy(CtaTemplateService):
                 self.base_size + self.friction_size,
                 "MACD上穿零轴"
             )
+            self.friction_entry_price = bar.close_price
         elif macd_cross_down:
             if self.pos > self.base_size and self.pos_avg_price > 0:
                 current_profit: float = round(
@@ -515,6 +561,9 @@ class BottomFrictionStrategy(CtaTemplateService):
             else:
                 self.active_buy_orders.pop(order.vt_orderid, None)
 
+        if mark == "摩擦仓止盈" and not order.is_active():
+            self.friction_tp_pending = False
+
     def on_trade(self, trade: TradeData) -> None:
         """成交更新回调。"""
         direction: str = trade.direction.value if trade.direction else ""
@@ -537,6 +586,9 @@ class BottomFrictionStrategy(CtaTemplateService):
                 self.pos_avg_price = round(float(trade.price), 2)
         elif trade.direction == Direction.SHORT and trade.offset == Offset.CLOSE:
             self.pos_avg_price = 0.0
+
+        if self.pos <= self.base_size:
+            self.friction_entry_price = 0.0
 
         self.put_event()
 
