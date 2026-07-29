@@ -35,6 +35,8 @@ class BottomFrictionStrategy(CtaTemplateService):
     5. MACD 上穿 0 轴时，买入摩擦仓位；MACD 下穿 0 轴时，卖出摩擦仓位。
     6. 下跌超过3500家且超过1/3板块偏弱时仓位减半；下跌超过4000家时清仓。
     7. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
+    8. 持仓最高收益率回撤达到设定点数时，清仓。
+    9. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
     """
 
     author = "Copilot"
@@ -50,6 +52,9 @@ class BottomFrictionStrategy(CtaTemplateService):
     profit_take_points: float = 3.0
     profit_take_min_points: float = 2.0
     friction_take_profit_points: float = 2.0
+    max_profit_drawdown_points: float = 10.0
+    profit_protection_trigger_points: float = 10.0
+    profit_protection_floor_points: float = 5.0
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
@@ -71,6 +76,9 @@ class BottomFrictionStrategy(CtaTemplateService):
     avg_price: float = 0.0
     pos_avg_price: float = 0.0
     friction_entry_price: float = 0.0
+    peak_profit_points: float = 0.0
+    profit_drawdown_active: bool = False
+    profit_protection_active: bool = False
     market_sentiment_score: float = 0.0
     market_declining_count: int = 0
     declining_sector_count: int = 0
@@ -89,6 +97,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "profit_take_points",
         "profit_take_min_points",
         "friction_take_profit_points",
+        "max_profit_drawdown_points",
+        "profit_protection_trigger_points",
+        "profit_protection_floor_points",
         "market_sentiment_enabled",
         "market_decline_reduce_threshold",
         "market_decline_exit_threshold",
@@ -105,6 +116,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "profit_take_points": "止盈",
         "profit_take_min_points": "最低止盈",
         "friction_take_profit_points": "摩擦止盈",
+        "max_profit_drawdown_points": "最大收益回撤",
+        "profit_protection_trigger_points": "收益保护触发点",
+        "profit_protection_floor_points": "最低保护收益",
         "market_sentiment_enabled": "情绪开关",
         "market_decline_reduce_threshold": "大盘减仓数",
         "market_decline_exit_threshold": "大盘清仓数",
@@ -118,6 +132,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "avg_price",
         "pos_avg_price",
         "friction_entry_price",
+        "peak_profit_points",
+        "profit_drawdown_active",
+        "profit_protection_active",
         "market_sentiment_score",
         "market_declining_count",
         "declining_sector_count",
@@ -134,6 +151,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         "avg_price": "均价",
         "pos_avg_price": "持仓均价",
         "friction_entry_price": "摩擦入场价",
+        "peak_profit_points": "最高收益率",
+        "profit_drawdown_active": "收益回撤清仓中",
+        "profit_protection_active": "收益保护已激活",
         "market_sentiment_score": "情绪分",
         "market_declining_count": "下跌家数",
         "declining_sector_count": "弱势板块数",
@@ -170,6 +190,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.avg_trading_day: date | None = None
         self.active_buy_orders: dict[str, float] = {}
         self.friction_tp_pending: bool = False
+        self.profit_drawdown_pending: bool = False
+        self.profit_drawdown_active = False
+        self.profit_protection_active = False
         self.sentiment_service: MarketSentimentService | None = None
 
     def on_init(self) -> None:
@@ -185,9 +208,13 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.avg_trading_day = None
         self.active_buy_orders.clear()
         self.friction_tp_pending = False
+        self.profit_drawdown_pending = False
+        self.profit_drawdown_active = False
+        self.profit_protection_active = False
         self.avg_price = 0.0
         self.pos_avg_price = 0.0
         self.friction_entry_price = 0.0
+        self.peak_profit_points = 0.0
         self.macd_line = 0.0
         self.signal_line = 0.0
         self.macd_hist = 0.0
@@ -243,7 +270,95 @@ class BottomFrictionStrategy(CtaTemplateService):
                 2,
             )
 
+        if self._check_profit_drawdown(tick.last_price):
+            exit_price: float = (
+                tick.bid_price_1
+                if tick.bid_price_1 > 0
+                else tick.last_price
+            )
+            self._submit_profit_drawdown_exit(exit_price)
+            self.put_event()
+            return
+
         self._check_friction_take_profit(tick)
+
+    def _check_profit_drawdown(self, last_price: float) -> bool:
+        """检查最高收益率是否已回撤到清仓阈值。"""
+        if self.pos <= 0 or self.pos_avg_price <= 0 or last_price <= 0:
+            if self.pos <= 0:
+                self.peak_profit_points = 0.0
+                self.profit_drawdown_pending = False
+                self.profit_drawdown_active = False
+                self.profit_protection_active = False
+            return False
+
+        if self.profit_drawdown_active:
+            return True
+
+        current_profit_points: float = round(
+            (last_price - self.pos_avg_price)
+            / self.pos_avg_price
+            * 100,
+            2,
+        )
+        self.peak_profit_points = max(
+            self.peak_profit_points,
+            current_profit_points,
+        )
+
+        if (
+            self.profit_protection_trigger_points > 0
+            and self.peak_profit_points
+            > self.profit_protection_trigger_points
+        ):
+            self.profit_protection_active = True
+
+        protected_profit_hit: bool = (
+            self.profit_protection_active
+            and current_profit_points
+            <= self.profit_protection_floor_points
+        )
+
+        triggered: bool = (
+            protected_profit_hit
+            or (
+                self.max_profit_drawdown_points > 0
+                and self.peak_profit_points > 0
+                and self.peak_profit_points - current_profit_points
+                >= self.max_profit_drawdown_points
+            )
+        )
+        if triggered:
+            self.profit_drawdown_active = True
+        return triggered
+
+    def _submit_profit_drawdown_exit(self, price: float) -> None:
+        """撤销未成交委托并卖出当前全部可卖持仓。"""
+        if self.profit_drawdown_pending:
+            return
+
+        self.cancel_all()
+        available: float = (
+            max(self.yd_pos - self.local_sell_frozen, 0)
+            if self.t1
+            else self.pos
+        )
+        sell_volume: int = int(min(self.pos, available))
+        if self.shares_per_lot > 0:
+            sell_volume = (
+                sell_volume // self.shares_per_lot
+                * self.shares_per_lot
+            )
+        if sell_volume <= 0:
+            return
+
+        vt_orderids: list[str] = self.sell(
+            price,
+            sell_volume,
+            mark="收益回撤清仓",
+        )
+        if vt_orderids:
+            self.profit_drawdown_pending = True
 
     def _check_friction_take_profit(self, tick: TickData) -> None:
         """价格涨到摩擦入场价+止盈点数时，到价卖出摩擦仓回到底仓。"""
@@ -282,6 +397,12 @@ class BottomFrictionStrategy(CtaTemplateService):
         """收到 1 分钟 K 线时执行。"""
         am: ArrayManager = self.am
         am.update_bar(bar)
+
+        if self._check_profit_drawdown(bar.close_price):
+            self._submit_profit_drawdown_exit(bar.close_price)
+            self.put_event()
+            return
+
         if not am.inited:
             return
 
@@ -563,6 +684,8 @@ class BottomFrictionStrategy(CtaTemplateService):
 
         if mark == "摩擦仓止盈" and not order.is_active():
             self.friction_tp_pending = False
+        if mark == "收益回撤清仓" and not order.is_active():
+            self.profit_drawdown_pending = False
 
     def on_trade(self, trade: TradeData) -> None:
         """成交更新回调。"""
@@ -574,6 +697,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.send_wecom(message)
 
         if trade.direction == Direction.LONG and trade.offset == Offset.OPEN:
+            new_position: bool = self.pos <= trade.volume
             if self.pos > trade.volume:
                 self.pos_avg_price = round(
                     (
@@ -584,8 +708,26 @@ class BottomFrictionStrategy(CtaTemplateService):
                 )
             else:
                 self.pos_avg_price = round(float(trade.price), 2)
+            self.peak_profit_points = max(
+                round(
+                    (trade.price - self.pos_avg_price)
+                    / self.pos_avg_price
+                    * 100,
+                    2,
+                ),
+                0.0,
+            )
+            if new_position:
+                self.profit_drawdown_active = False
+                self.profit_drawdown_pending = False
+                self.profit_protection_active = False
         elif trade.direction == Direction.SHORT and trade.offset == Offset.CLOSE:
-            self.pos_avg_price = 0.0
+            if self.pos <= 0:
+                self.pos_avg_price = 0.0
+                self.peak_profit_points = 0.0
+                self.profit_drawdown_pending = False
+                self.profit_drawdown_active = False
+                self.profit_protection_active = False
 
         if self.pos <= self.base_size:
             self.friction_entry_price = 0.0
