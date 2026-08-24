@@ -3,6 +3,7 @@ from datetime import date, time
 import numpy as np
 
 from vnpy.trader.constant import Direction, Offset
+from vnpy.trader.utility import load_json
 
 from vnpy_ctastrategy import (
     StopOrder,
@@ -37,6 +38,7 @@ class BottomFrictionStrategy(CtaTemplateService):
     7. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
     8. 持仓最高收益率回撤达到设定点数时，清仓。
     9. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
+    10. 当天已经清仓后，当天不再买入。
     """
 
     author = "Copilot"
@@ -86,6 +88,8 @@ class BottomFrictionStrategy(CtaTemplateService):
     declining_sector_ratio: float = 0.0
     sentiment_risk_level: int = 0
     sentiment_target_pos: int = -1
+    cleared_today: bool = False
+    cleared_day: str = ""
 
     parameters = [
         "base_size",
@@ -142,6 +146,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         "declining_sector_ratio",
         "sentiment_risk_level",
         "sentiment_target_pos",
+        "cleared_today",
+        "cleared_day",
     ]
     variable_labels = {
         "fast_slow_ma": "快慢线值",
@@ -161,6 +167,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         "declining_sector_ratio": "弱势板块比",
         "sentiment_risk_level": "情绪风险",
         "sentiment_target_pos": "情绪目标仓",
+        "cleared_today": "当天已清仓",
+        "cleared_day": "清仓日期",
     }
 
     def __init__(
@@ -193,6 +201,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.profit_drawdown_pending: bool = False
         self.profit_drawdown_active = False
         self.profit_protection_active = False
+        self.cleared_today = False
+        self.cleared_day = ""
+        self.cleared_trading_day: date | None = None
         self.sentiment_service: MarketSentimentService | None = None
 
     def on_init(self) -> None:
@@ -228,6 +239,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.declining_sector_ratio = 0.0
         self.sentiment_risk_level = 0
         self.sentiment_target_pos = -1
+        self.cleared_today = False
+        self.cleared_day = ""
+        self.cleared_trading_day = None
 
         if (
             self.market_sentiment_enabled
@@ -244,11 +258,13 @@ class BottomFrictionStrategy(CtaTemplateService):
             self.sentiment_service = None
 
         self.load_bar(60)
+        self._load_cleared_state()
 
     def on_start(self) -> None:
         """策略启动。"""
         if self.sentiment_service is not None:
             self.sentiment_service.start()
+        self._load_cleared_state()
         self.put_event()
 
     def on_stop(self) -> None:
@@ -260,6 +276,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.bg.update_tick(tick)
 
         trading_day: date = tick.datetime.date()
+        self._sync_cleared_trading_day(trading_day)
         if trading_day != self.avg_trading_day:
             self.avg_trading_day = trading_day
             self.avg_price = 0.0
@@ -359,6 +376,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         )
         if vt_orderids:
             self.profit_drawdown_pending = True
+            self._mark_cleared_today()
 
     def _check_friction_take_profit(self, tick: TickData) -> None:
         """价格涨到摩擦入场价+止盈点数时，到价卖出摩擦仓回到底仓。"""
@@ -392,6 +410,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         )
         if vt_orderids:
             self.friction_tp_pending = True
+            if sell_volume >= self.pos:
+                self._mark_cleared_today()
 
     def on_bar(self, bar: BarData) -> None:
         """收到 1 分钟 K 线时执行。"""
@@ -574,9 +594,75 @@ class BottomFrictionStrategy(CtaTemplateService):
 
         return 0
 
+    def _read_persisted_strategy_data(self) -> dict:
+        """读取本策略在 CTA 数据文件中的持久化变量。"""
+        engine: object = self.cta_engine
+        filename: str = str(getattr(engine, "data_filename", "") or "")
+        file_data: dict | None = None
+        if filename:
+            loaded = load_json(filename)
+            if isinstance(loaded, dict):
+                file_data = loaded
+                cached = getattr(engine, "strategy_data", None)
+                if isinstance(cached, dict) and self.strategy_name in file_data:
+                    cached[self.strategy_name] = file_data[self.strategy_name]
+
+        if isinstance(file_data, dict):
+            data = file_data.get(self.strategy_name)
+            if isinstance(data, dict):
+                return data
+
+        cached = getattr(engine, "strategy_data", None)
+        if isinstance(cached, dict):
+            data = cached.get(self.strategy_name)
+            if isinstance(data, dict):
+                return data
+        return {}
+
+    def _load_cleared_state(self) -> None:
+        """启动/初始化时加载清仓日期，并按当天刷新禁买标记。"""
+        data: dict = self._read_persisted_strategy_data()
+        cleared_day = data.get("cleared_day")
+        if isinstance(cleared_day, str) and cleared_day:
+            self.cleared_day = cleared_day
+
+        self._sync_cleared_trading_day(date.today())
+        if self.cleared_day:
+            status: str = "当天不再买入" if self.cleared_today else "非当天，允许买入"
+            self.write_log(f"已加载清仓日期{self.cleared_day}，{status}")
+
+    def _sync_cleared_trading_day(self, trading_day: date) -> None:
+        """按当前交易日刷新当天清仓标记，兼容进程重启后的持久化恢复。"""
+        self.cleared_trading_day = trading_day
+        self.cleared_today = self._is_cleared_on(trading_day)
+
+    def _is_cleared_on(self, trading_day: date) -> bool:
+        """判断指定交易日是否已经清仓。"""
+        return bool(self.cleared_day) and self.cleared_day == trading_day.isoformat()
+
+    def _mark_cleared_today(self) -> None:
+        """标记当天已清仓，并立即写入磁盘，避免进程重启后丢失。"""
+        if not self.inited:
+            return
+
+        trading_day: date = (
+            self.cleared_trading_day
+            or self.macd_trading_day
+            or self.avg_trading_day
+            or date.today()
+        )
+        day_text: str = trading_day.isoformat()
+        newly_marked: bool = self.cleared_day != day_text
+        self.cleared_day = day_text
+        self.cleared_today = True
+        if newly_marked:
+            self.write_log("当天已清仓，当天不再买入")
+        self.sync_data()
+
     def _prepare_intraday_macd(self, bar: BarData) -> bool:
         """切换交易日并过滤 09:30 之前的无效分钟数据。"""
         trading_day: date = bar.datetime.date()
+        self._sync_cleared_trading_day(trading_day)
 
         if trading_day != self.macd_trading_day:
             self.macd_trading_day = trading_day
@@ -640,6 +726,9 @@ class BottomFrictionStrategy(CtaTemplateService):
         effective_pos: float = round(self.pos + pending_buy_volume, 2)
 
         if target_pos > effective_pos:
+            if self._is_cleared_on(bar.datetime.date()):
+                return
+
             buy_volume: int = int(target_pos - effective_pos)
             if buy_volume > 0:
                 vt_orderids: list[str] = self.buy(
@@ -658,6 +747,8 @@ class BottomFrictionStrategy(CtaTemplateService):
             sell_volume: int = int(self.pos - target_pos)
             if sell_volume > 0:
                 self.sell(bar.close_price, sell_volume, mark=mark)
+                if target_pos == 0:
+                    self._mark_cleared_today()
 
     def on_order(self, order: OrderData) -> None:
         """订单更新回调。"""
@@ -728,6 +819,7 @@ class BottomFrictionStrategy(CtaTemplateService):
                 self.profit_drawdown_pending = False
                 self.profit_drawdown_active = False
                 self.profit_protection_active = False
+                self._mark_cleared_today()
 
         if self.pos <= self.base_size:
             self.friction_entry_price = 0.0
