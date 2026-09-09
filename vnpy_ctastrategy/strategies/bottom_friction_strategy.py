@@ -14,13 +14,8 @@ from vnpy_ctastrategy import (
     BarGenerator,
     ArrayManager,
 )
-from vnpy_ctastrategy.base import EngineType
 
 from .base import CtaTemplateService
-from .market_sentiment import (
-    MarketSentimentService,
-    MarketSentimentSnapshot,
-)
 from .talib_indicators import EmaMacdCalculator, MacdResult
 
 
@@ -34,11 +29,10 @@ class BottomFrictionStrategy(CtaTemplateService):
     3. 收盘价低于10日均线时，清仓。
     4. 亏损超过 5 点时，清仓。
     5. MACD 上穿 0 轴时，买入摩擦仓位；MACD 下穿 0 轴时，卖出摩擦仓位。
-    6. 下跌超过3500家且超过1/3板块偏弱时仓位减半；下跌超过4000家时清仓。
-    7. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
-    8. 持仓最高收益率回撤达到设定点数时，清仓。
-    9. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
-    10. 当天已经清仓后，当天不再买入。
+    6. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
+    7. 持仓最高收益率回撤达到设定点数时，清仓。
+    8. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
+    9. 当天已经清仓后，当天不再买入。
     """
 
     author = "Copilot"
@@ -61,10 +55,6 @@ class BottomFrictionStrategy(CtaTemplateService):
     macd_slow: int = 26
     macd_signal: int = 9
     shares_per_lot: int = 100
-    market_sentiment_enabled: bool = True
-    market_decline_reduce_threshold: int = 3500
-    market_decline_exit_threshold: int = 4000
-    sector_decline_ratio_threshold: float = round(1 / 3, 2)
 
     fast_ma: float = 0.0
     slow_ma: float = 0.0
@@ -81,13 +71,6 @@ class BottomFrictionStrategy(CtaTemplateService):
     peak_profit_points: float = 0.0
     profit_drawdown_active: bool = False
     profit_protection_active: bool = False
-    market_sentiment_score: float = 0.0
-    market_declining_count: int = 0
-    declining_sector_count: int = 0
-    valid_sector_count: int = 0
-    declining_sector_ratio: float = 0.0
-    sentiment_risk_level: int = 0
-    sentiment_target_pos: int = -1
     cleared_today: bool = False
     cleared_day: str = ""
 
@@ -104,10 +87,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         "max_profit_drawdown_points",
         "profit_protection_trigger_points",
         "profit_protection_floor_points",
-        "market_sentiment_enabled",
-        "market_decline_reduce_threshold",
-        "market_decline_exit_threshold",
-        "sector_decline_ratio_threshold",
     ]
     parameter_labels = {
         "t1": "T+1",
@@ -123,10 +102,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         "max_profit_drawdown_points": "最大收益回撤",
         "profit_protection_trigger_points": "收益保护触发点",
         "profit_protection_floor_points": "最低保护收益",
-        "market_sentiment_enabled": "情绪开关",
-        "market_decline_reduce_threshold": "大盘减仓数",
-        "market_decline_exit_threshold": "大盘清仓数",
-        "sector_decline_ratio_threshold": "板块弱势比",
     }
     variables = [
         "fast_slow_ma",
@@ -139,13 +114,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         "peak_profit_points",
         "profit_drawdown_active",
         "profit_protection_active",
-        "market_sentiment_score",
-        "market_declining_count",
-        "declining_sector_count",
-        "valid_sector_count",
-        "declining_sector_ratio",
-        "sentiment_risk_level",
-        "sentiment_target_pos",
         "cleared_today",
         "cleared_day",
     ]
@@ -160,13 +128,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         "peak_profit_points": "最高收益率",
         "profit_drawdown_active": "收益回撤清仓中",
         "profit_protection_active": "收益保护已激活",
-        "market_sentiment_score": "情绪分",
-        "market_declining_count": "下跌家数",
-        "declining_sector_count": "弱势板块数",
-        "valid_sector_count": "有效板块数",
-        "declining_sector_ratio": "弱势板块比",
-        "sentiment_risk_level": "情绪风险",
-        "sentiment_target_pos": "情绪目标仓",
         "cleared_today": "当天已清仓",
         "cleared_day": "清仓日期",
     }
@@ -204,7 +165,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.cleared_today = False
         self.cleared_day = ""
         self.cleared_trading_day: date | None = None
-        self.sentiment_service: MarketSentimentService | None = None
 
     def on_init(self) -> None:
         """策略初始化。"""
@@ -232,38 +192,15 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.last_macd_hist = 0.0
         self.fast_slow_ma = ""
         self.macd_triple = ""
-        self.market_sentiment_score = 0.0
-        self.market_declining_count = 0
-        self.declining_sector_count = 0
-        self.valid_sector_count = 0
-        self.declining_sector_ratio = 0.0
-        self.sentiment_risk_level = 0
-        self.sentiment_target_pos = -1
         self.cleared_today = False
         self.cleared_day = ""
         self.cleared_trading_day = None
-
-        if (
-            self.market_sentiment_enabled
-            and self.get_engine_type() == EngineType.LIVE
-        ):
-            self.sentiment_service = (
-                MarketSentimentService.get_shared(
-                    name="a_share",
-                    refresh_interval=10,
-                    stale_after=30,
-                )
-            )
-        else:
-            self.sentiment_service = None
 
         self.load_bar(60)
         self._load_cleared_state()
 
     def on_start(self) -> None:
         """策略启动。"""
-        if self.sentiment_service is not None:
-            self.sentiment_service.start()
         self._load_cleared_state()
         self.put_event()
 
@@ -463,10 +400,6 @@ class BottomFrictionStrategy(CtaTemplateService):
             self.put_event()
             return
 
-        if self._apply_market_sentiment_risk(bar):
-            self.put_event()
-            return
-
         if self.fast_ma > self.slow_ma:
             self._set_target_position(bar, self.base_size, "均线多头排列，回到底仓")
             self.put_event()
@@ -510,89 +443,6 @@ class BottomFrictionStrategy(CtaTemplateService):
             self._set_target_position(bar, self.pos)
 
         self.put_event()
-
-    def _apply_market_sentiment_risk(self, bar: BarData) -> bool:
-        """在普通交易信号前执行全市场和板块情绪风控。"""
-        if (
-            not self.market_sentiment_enabled
-            or self.sentiment_service is None
-        ):
-            return False
-
-        snapshot: MarketSentimentSnapshot = (
-            self.sentiment_service.get_latest()
-        )
-        if not snapshot.available:
-            self.sentiment_risk_level = 0
-            self.sentiment_target_pos = -1
-            return False
-
-        risk_level: int = self._evaluate_market_sentiment(snapshot)
-
-        if risk_level == 0:
-            self.sentiment_risk_level = 0
-            self.sentiment_target_pos = -1
-            return False
-
-        if risk_level != self.sentiment_risk_level:
-            if risk_level == 2:
-                self.sentiment_target_pos = 0
-            else:
-                self.sentiment_target_pos = max(
-                    0,
-                    int(self.pos / 2),
-                )
-            self.sentiment_risk_level = risk_level
-
-        mark: str = (
-            "市场超过4000家下跌，清仓"
-            if risk_level == 2
-            else "市场和板块偏弱，仓位减半"
-        )
-        self._set_target_position(
-            bar,
-            self.sentiment_target_pos,
-            mark,
-        )
-        return True
-
-    def _evaluate_market_sentiment(
-        self,
-        snapshot: MarketSentimentSnapshot,
-    ) -> int:
-        """更新情绪变量并返回风险级别：0正常、1减半、2清仓。"""
-        self.market_sentiment_score = round(float(snapshot.score), 2)
-        self.market_declining_count = snapshot.breadth.declining
-
-        sector_states = list(snapshot.sectors.values())
-        self.valid_sector_count = len(sector_states)
-        self.declining_sector_count = sum(
-            state.breadth.declining > state.breadth.advancing
-            for state in sector_states
-        )
-        if self.valid_sector_count:
-            self.declining_sector_ratio = round(
-                self.declining_sector_count / self.valid_sector_count,
-                2,
-            )
-        else:
-            self.declining_sector_ratio = 0.0
-
-        if (
-            self.market_declining_count
-            > self.market_decline_exit_threshold
-        ):
-            return 2
-
-        if (
-            self.market_declining_count
-            > self.market_decline_reduce_threshold
-            and self.declining_sector_ratio
-            > self.sector_decline_ratio_threshold
-        ):
-            return 1
-
-        return 0
 
     def _read_persisted_strategy_data(self) -> dict:
         """读取本策略在 CTA 数据文件中的持久化变量。"""
