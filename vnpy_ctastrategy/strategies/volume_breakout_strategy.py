@@ -1,11 +1,7 @@
 from collections import deque
-from datetime import datetime
 from math import isfinite
 
 import numpy as np
-import polars as pl
-
-from vnpy.alpha.dataset.utility import calculate_by_expression
 
 from vnpy_ctastrategy import (
     ArrayManager,
@@ -118,7 +114,6 @@ class VolumeBreakoutStrategy(CtaTemplate):
             self.atr_window,
         ) + 2
         self.am: ArrayManager = ArrayManager(size=max(100, required_size))
-        self.factor_datetimes: deque[datetime] = deque(maxlen=required_size)
         self.factor_volumes: deque[float] = deque(maxlen=required_size)
         self.bar_count: int = 0
         self.active_entry_orders: dict[
@@ -155,7 +150,6 @@ class VolumeBreakoutStrategy(CtaTemplate):
     def on_bar(self, bar: BarData) -> None:
         """处理一根已完成的 K 线。"""
         self.bar_count += 1
-        self.factor_datetimes.append(bar.datetime)
         self.factor_volumes.append(float(bar.volume))
         self.am.update_bar(bar)
         if not self.am.inited:
@@ -488,26 +482,24 @@ class VolumeBreakoutStrategy(CtaTemplate):
             self.active_stop_price = 0.0
 
     def _calculate_alpha_vma(self) -> float:
-        """使用 vnpy.alpha 表达式引擎计算 Alpha158 VMA 因子。"""
-        factor_df: pl.DataFrame = pl.DataFrame(
-            {
-                "datetime": list(self.factor_datetimes),
-                "vt_symbol": [self.vt_symbol] * len(self.factor_datetimes),
-                "volume": list(self.factor_volumes),
-            }
-        )
-        expression: str = (
-            f"ts_mean(volume, {self.volume_window}) / (volume + 1e-12)"
-        )
-        result_df: pl.DataFrame = calculate_by_expression(
-            factor_df,
-            expression,
-        )
-        factor_value: float | None = result_df["data"][-1]
+        """计算 Alpha158 VMA 因子：ts_mean(volume, window) / (volume + 1e-12)。
 
-        if factor_value is None:
+        因子越小，表示当前成交量相对滚动均量越大。
+        与 vnpy.alpha 表达式引擎结果一致，使用 numpy 直接计算，
+        避免 polars 与 vnpy.alpha 的外部依赖。
+        """
+        volumes: np.ndarray = np.asarray(
+            self.factor_volumes,
+            dtype=np.float64,
+        )
+        if len(volumes) < self.volume_window:
             return float("nan")
-        return float(factor_value)
+
+        recent_mean: float = float(
+            np.mean(volumes[-self.volume_window:])
+        )
+        current_volume: float = float(volumes[-1])
+        return recent_mean / (current_volume + 1e-12)
 
     def _parameters_valid(self) -> bool:
         """检查会影响数组切片和下单的关键参数。"""
