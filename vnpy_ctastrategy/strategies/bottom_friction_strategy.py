@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import date, time
 
 import numpy as np
@@ -16,7 +18,14 @@ from vnpy_ctastrategy import (
 )
 
 from .base import CtaTemplateService
-from .talib_indicators import EmaMacdCalculator, MacdResult
+from .signals import (
+    SECTOR_STRONG_ENTRY_MARK,
+    BottomFrictionBarSignal,
+    BottomFrictionTickSignal,
+    FrictionResult,
+    ProfitDrawdownState,
+    SignalType,
+)
 
 
 class BottomFrictionStrategy(CtaTemplateService):
@@ -29,10 +38,14 @@ class BottomFrictionStrategy(CtaTemplateService):
     3. 收盘价低于10日均线时，清仓。
     4. 亏损超过 5 点时，清仓。
     5. MACD 上穿 0 轴时，买入摩擦仓位；MACD 下穿 0 轴时，卖出摩擦仓位。
-    6. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
-    7. 持仓最高收益率回撤达到设定点数时，清仓。
-    8. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
-    9. 当天已经清仓后，当天不再买入。
+    6. 下跌超过3500家且超过1/3板块偏弱时仓位减半；下跌超过4000家时清仓。
+    7. 标的所属行业情绪分低于阈值（默认 40，即偏弱及以下）时，卖出摩擦仓回到底仓。
+    8. 标的所属行业情绪分不低于阈值（默认 80，即极强）且摩擦位为空时，买入摩擦仓位（一天最多一次）。
+    9. 买入摩擦仓位后，记录入场价；涨幅超过摩擦止盈点数时，卖出摩擦仓位回到底仓。
+    10. 行业极强买入的摩擦仓，按成交价 + 行业极强仓止盈点数挂卖出停止单（默认 2 个点）。
+    11. 持仓最高收益率回撤达到设定点数时，清仓。
+    12. 最高收益率超过保护阈值后，回落到最低保护收益时，清仓。
+    13. 当天已经清仓后，当天不再买入。
     """
 
     author = "Copilot"
@@ -55,6 +68,14 @@ class BottomFrictionStrategy(CtaTemplateService):
     macd_slow: int = 26
     macd_signal: int = 9
     shares_per_lot: int = 100
+    market_sentiment_enabled: bool = True
+    market_decline_reduce_threshold: int = 3500
+    market_decline_exit_threshold: int = 4000
+    sector_decline_ratio_threshold: float = round(1 / 3, 2)
+    sector_score_exit_threshold: float = 40.0
+    # 固定常量（不进 parameters）：行业极强入场线与行业极强仓止盈点数
+    sector_score_entry_threshold: float = 80.0
+    sector_strong_take_profit_points: float = 2.0
 
     fast_ma: float = 0.0
     slow_ma: float = 0.0
@@ -71,6 +92,8 @@ class BottomFrictionStrategy(CtaTemplateService):
     peak_profit_points: float = 0.0
     profit_drawdown_active: bool = False
     profit_protection_active: bool = False
+    market_sentiment_score: float = 0.0
+    market_declining_count: int = 0
     cleared_today: bool = False
     cleared_day: str = ""
 
@@ -87,6 +110,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "max_profit_drawdown_points",
         "profit_protection_trigger_points",
         "profit_protection_floor_points",
+        "sector_score_exit_threshold",
     ]
     parameter_labels = {
         "t1": "T+1",
@@ -102,6 +126,7 @@ class BottomFrictionStrategy(CtaTemplateService):
         "max_profit_drawdown_points": "最大收益回撤",
         "profit_protection_trigger_points": "收益保护触发点",
         "profit_protection_floor_points": "最低保护收益",
+        "sector_score_exit_threshold": "行业情绪减仓线",
     }
     variables = [
         "fast_slow_ma",
@@ -114,6 +139,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         "peak_profit_points",
         "profit_drawdown_active",
         "profit_protection_active",
+        "market_sentiment_score",
+        "market_declining_count",
         "cleared_today",
         "cleared_day",
     ]
@@ -128,6 +155,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         "peak_profit_points": "最高收益率",
         "profit_drawdown_active": "收益回撤清仓中",
         "profit_protection_active": "收益保护已激活",
+        "market_sentiment_score": "情绪分",
+        "market_declining_count": "下跌家数",
         "cleared_today": "当天已清仓",
         "cleared_day": "清仓日期",
     }
@@ -140,18 +169,14 @@ class BottomFrictionStrategy(CtaTemplateService):
         setting: dict,
     ) -> None:
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
-        self.macd_calculator: EmaMacdCalculator = EmaMacdCalculator(
-            fast_period=self.macd_fast,
-            slow_period=self.macd_slow,
-            signal_period=self.macd_signal,
-        )
-        # 保留原属性，兼容现有派生策略和指标比较脚本。
-        self.close_prices: list[float] = (
-            self.macd_calculator.close_prices
-        )
-        self.macd_values: list[float] = (
-            self.macd_calculator.macd_values
-        )
+        # bar 决策总信号：持有 friction/sentiment，on_bar 内部 prepare + 决策
+        self.bar_signal: BottomFrictionBarSignal = BottomFrictionBarSignal(self)
+        # tick 保护总信号：聚合收益回撤 + 摩擦止盈优先级链
+        self.tick_signal: BottomFrictionTickSignal = BottomFrictionTickSignal(self)
+        # 收益回撤判定状态机：bar/tick 共用同一实例，check 后反向写 UI 变量
+        self.profit_drawdown: ProfitDrawdownState = ProfitDrawdownState(self)
+        self._friction_result: FrictionResult | None = None
+        self._intraday_ready: bool = False
         self.daily_close_prices: list[float] = []
         self.current_day: date | None = None
         self.day_close_price: float = 0.0
@@ -160,8 +185,14 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.active_buy_orders: dict[str, float] = {}
         self.friction_tp_pending: bool = False
         self.profit_drawdown_pending: bool = False
-        self.profit_drawdown_active = False
-        self.profit_protection_active = False
+        # 行业极强买入仓位：成交均价 + 累计成交量/金额（分笔成交加权）+ 我方委托号
+        self.sector_strong_entry_price: float = 0.0
+        self.sector_strong_filled_volume: float = 0.0
+        self.sector_strong_filled_amount: float = 0.0
+        self.sector_strong_orderids: set[str] = set()
+        # 行业极强操作一天只做一次：最后成交日 + 当天是否已操作（按交易日刷新）
+        self.sector_strong_day: str = ""
+        self.sector_strong_today: bool = False
         self.cleared_today = False
         self.cleared_day = ""
         self.cleared_trading_day: date | None = None
@@ -171,7 +202,10 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.bg: BarGenerator = BarGenerator(self.on_bar)
         self.am: ArrayManager = ArrayManager()
 
-        self.macd_calculator.reset()
+        self.bar_signal.reset()
+        self.profit_drawdown.reset()
+        self._intraday_ready = False
+        self._friction_result = None
         self.daily_close_prices = []
         self.current_day = None
         self.day_close_price = 0.0
@@ -180,12 +214,12 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.active_buy_orders.clear()
         self.friction_tp_pending = False
         self.profit_drawdown_pending = False
-        self.profit_drawdown_active = False
-        self.profit_protection_active = False
+        self._reset_sector_strong_position()
+        self.sector_strong_day = ""
+        self.sector_strong_today = False
         self.avg_price = 0.0
         self.pos_avg_price = 0.0
         self.friction_entry_price = 0.0
-        self.peak_profit_points = 0.0
         self.macd_line = 0.0
         self.signal_line = 0.0
         self.macd_hist = 0.0
@@ -195,12 +229,15 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.cleared_today = False
         self.cleared_day = ""
         self.cleared_trading_day = None
+        self.market_sentiment_score = 0.0
+        self.market_declining_count = 0
 
         self.load_bar(60)
         self._load_cleared_state()
 
     def on_start(self) -> None:
         """策略启动。"""
+        self.bar_signal.check_health()
         self._load_cleared_state()
         self.put_event()
 
@@ -209,7 +246,17 @@ class BottomFrictionStrategy(CtaTemplateService):
         self.put_event()
 
     def on_tick(self, tick: TickData) -> None:
-        """收到 tick 数据时，送入分钟级 BarGenerator。"""
+        """收到 tick 数据时：送入分钟级 BarGenerator，再跑 tick 保护信号链（判定 + 执行）。
+
+        ``bg.update_tick`` 可能同步触发 ``on_bar``（bar_signal 内含收益回撤早检查）；
+        随后 ``tick_signal.on_tick`` 跑优先级链（收益回撤 → 摩擦止盈），命中即由信号层按
+        ``SignalResult.executor`` 分派到 ``_submit_profit_drawdown_exit`` /
+        ``_submit_friction_take_profit``，执行价 ``SignalResult.price`` 也由信号层按 tick 算好。
+        策略这里只做行情维护（交易日/均价）+ 命中后的 UI 事件刷新，不再判 executor。
+
+        收益回撤判定由 ``profit_drawdown`` 状态机（``ProfitDrawdownState``）完成，bar/tick 共用，
+        每 tick 更新峰值/激活标记并回写 UI 变量。
+        """
         self.bg.update_tick(tick)
 
         trading_day: date = tick.datetime.date()
@@ -224,67 +271,9 @@ class BottomFrictionStrategy(CtaTemplateService):
                 2,
             )
 
-        if self._check_profit_drawdown(tick.last_price):
-            exit_price: float = (
-                tick.bid_price_1
-                if tick.bid_price_1 > 0
-                else tick.last_price
-            )
-            self._submit_profit_drawdown_exit(exit_price)
+        self.tick_signal.on_tick(tick)
+        if self.tick_signal.signal_result(self.vt_symbol).type != SignalType.NONE:
             self.put_event()
-            return
-
-        self._check_friction_take_profit(tick)
-
-    def _check_profit_drawdown(self, last_price: float) -> bool:
-        """检查最高收益率是否已回撤到清仓阈值。"""
-        if self.pos <= 0 or self.pos_avg_price <= 0 or last_price <= 0:
-            if self.pos <= 0:
-                self.peak_profit_points = 0.0
-                self.profit_drawdown_pending = False
-                self.profit_drawdown_active = False
-                self.profit_protection_active = False
-            return False
-
-        if self.profit_drawdown_active:
-            return True
-
-        current_profit_points: float = round(
-            (last_price - self.pos_avg_price)
-            / self.pos_avg_price
-            * 100,
-            2,
-        )
-        self.peak_profit_points = max(
-            self.peak_profit_points,
-            current_profit_points,
-        )
-
-        if (
-            self.profit_protection_trigger_points > 0
-            and self.peak_profit_points
-            > self.profit_protection_trigger_points
-        ):
-            self.profit_protection_active = True
-
-        protected_profit_hit: bool = (
-            self.profit_protection_active
-            and current_profit_points
-            <= self.profit_protection_floor_points
-        )
-
-        triggered: bool = (
-            protected_profit_hit
-            or (
-                self.max_profit_drawdown_points > 0
-                and self.peak_profit_points > 0
-                and self.peak_profit_points - current_profit_points
-                >= self.max_profit_drawdown_points
-            )
-        )
-        if triggered:
-            self.profit_drawdown_active = True
-        return triggered
 
     def _submit_profit_drawdown_exit(self, price: float) -> None:
         """撤销未成交委托并卖出当前全部可卖持仓。"""
@@ -315,21 +304,14 @@ class BottomFrictionStrategy(CtaTemplateService):
             self.profit_drawdown_pending = True
             self._mark_cleared_today()
 
-    def _check_friction_take_profit(self, tick: TickData) -> None:
-        """价格涨到摩擦入场价+止盈点数时，到价卖出摩擦仓回到底仓。"""
-        if (
-            self.friction_entry_price <= 0
-            or self.friction_tp_pending
-            or self.pos <= self.base_size
-        ):
-            return
+    def _submit_friction_take_profit(self, price: float) -> None:
+        """执行器：到价卖出摩擦仓回到底仓（触发条件与执行价由信号层给出）。
 
-        target_price: float = round(
-            self.friction_entry_price
-            * (1 + self.friction_take_profit_points / 100),
-            2,
-        )
-        if tick.last_price < target_price:
+        信号侧 ``FrictionTakeProfitSubSignal`` 判定触发并算好 ``price``（买一价优先，买一无效
+        时回落最新价）；本执行器只做：pending 守卫、T+1 可卖量、卖出量、卖单、pending 标记、
+        清仓标记；不做整手取整（保持原 ``_check_friction_take_profit`` 行为）。
+        """
+        if self.friction_tp_pending:
             return
 
         available: float = max(self.yd_pos - self.local_sell_frozen, 0)
@@ -337,11 +319,8 @@ class BottomFrictionStrategy(CtaTemplateService):
         if sell_volume <= 0:
             return
 
-        sell_price: float = (
-            tick.bid_price_1 if tick.bid_price_1 > 0 else tick.last_price
-        )
         vt_orderids: list[str] = self.sell(
-            sell_price,
+            price,
             sell_volume,
             mark="摩擦仓止盈"
         )
@@ -350,99 +329,59 @@ class BottomFrictionStrategy(CtaTemplateService):
             if sell_volume >= self.pos:
                 self._mark_cleared_today()
 
-    def on_bar(self, bar: BarData) -> None:
-        """收到 1 分钟 K 线时执行。"""
-        am: ArrayManager = self.am
-        am.update_bar(bar)
+    def _reset_sector_strong_position(self) -> None:
+        """清空行业极强仓位的入场价/累计成交（仓位回到摩擦位以下时调用）。"""
+        self.sector_strong_entry_price = 0.0
+        self.sector_strong_filled_volume = 0.0
+        self.sector_strong_filled_amount = 0.0
+        self.sector_strong_orderids.clear()
 
-        if self._check_profit_drawdown(bar.close_price):
-            self._submit_profit_drawdown_exit(bar.close_price)
-            self.put_event()
-            return
+    def _record_sector_strong_fill(self, trade: TradeData) -> None:
+        """记录行业极强买入的成交，按成交量加权算出该仓位的成交均价，并标记当天已操作。
 
-        if not am.inited:
-            return
-
-        if not self._prepare_intraday_macd(bar):
-            return
-
-        self.cancel_all()
-
-        self._update_daily_close_series(bar)
-        self.fast_ma = self._calc_daily_ma(self.fast_window)
-        self.slow_ma = self._calc_daily_ma(self.slow_window)
-        self.ma10 = self._calc_daily_ma(self.ma10_window)
-
-        prev_macd_hist: float = self.macd_hist
-        self.macd_line, self.signal_line, self.macd_hist = self._calc_macd(bar.close_price)
-        self.last_macd_hist = prev_macd_hist
-
-        self.fast_slow_ma = f"{self.fast_ma}/{self.slow_ma}"
-        self.macd_triple = f"{self.macd_line}/{self.signal_line}/{self.macd_hist}"
-
-        macd_cross_up: bool = prev_macd_hist <= 0 and self.macd_hist > 0
-        macd_cross_down: bool = prev_macd_hist >= 0 and self.macd_hist < 0
-
-        if self.pos > 0 and self.pos_avg_price > 0:
-            current_loss: float = round(
-                (self.pos_avg_price - bar.close_price)
-                / self.pos_avg_price
-                * 100,
+        ``sector_strong_day``/``sector_strong_today`` 使这套操作**一天最多做一次**：
+        当天成交过之后，即使仓位又被其它规则卖回底仓，当天也不再重复买入。
+        """
+        self.sector_strong_filled_volume += float(trade.volume)
+        self.sector_strong_filled_amount += float(trade.price) * float(trade.volume)
+        if self.sector_strong_filled_volume > 0:
+            self.sector_strong_entry_price = round(
+                self.sector_strong_filled_amount / self.sector_strong_filled_volume,
                 2,
             )
-            if current_loss > self.stop_loss_points:
-                self._set_target_position(bar, 0, "止损")
-                self.put_event()
-                return
+        self.sector_strong_day = trade.datetime.date().isoformat()
+        self.sector_strong_today = True
 
-        if bar.close_price < self.ma10:
-            self._set_target_position(bar, 0, "跌破10日线")
-            self.put_event()
+    def _submit_sector_strong_stop_exit(self, price: float) -> None:
+        """执行器：按 ``price`` 挂卖出停止单，卖出摩擦位以上的全部可卖持仓。
+
+        信号侧 ``SectorStrongStopExitSubSignal`` 判定"持有行业极强仓"并算好触发价
+        （成交均价 × (1+行业极强仓止盈点数/100)）。本地停止单语义：``last_price <= 触发价``
+        时触发卖出（成交价为卖五价/跌停价）。每根 bar 的 ``cancel_all`` 会撤掉上一根的挂单，
+        所以由信号链每根 bar 刷新一次；仓位回到摩擦位以下时信号层不再下发。
+        """
+        available: float = (
+            max(self.yd_pos - self.local_sell_frozen, 0)
+            if self.t1
+            else self.pos
+        )
+        sell_volume: int = int(min(self.pos - self.base_size, available))
+        if sell_volume <= 0:
             return
 
-        if self.fast_ma > self.slow_ma:
-            self._set_target_position(bar, self.base_size, "均线多头排列，回到底仓")
+        self.sell(price, sell_volume, stop=True, mark="行业极强仓止盈")
+
+    def on_bar(self, bar: BarData) -> None:
+        """收到 1 分钟 K 线时执行（薄协调器）。
+
+        ``bar_signal.on_bar`` 内部完成 prepare（am.update_bar/收益回撤早检查/09:30门控/MA/
+        摩擦EMA/cancel_all/UI同步）+ 决策（收益回撤优先 + 6 决策优先级链），命中即由信号层按
+        ``SignalResult.executor`` 分派到 ``_submit_profit_drawdown_exit`` /
+        ``_set_target_position``。策略这里只做命中后的 UI 事件刷新。
+        """
+        self.bar_signal.on_bar(bar)
+        if self.bar_signal.signal_result(self.vt_symbol).type != SignalType.NONE:
             self.put_event()
-            return
-
-        if self.pos < self.base_size:
-            self._set_target_position(bar, self.base_size, "仓位低于底仓，补仓")
-            self.put_event()
-            return
-
-        if macd_cross_up:
-            self._set_target_position(
-                bar,
-                self.base_size + self.friction_size,
-                "MACD上穿零轴"
-            )
-            self.friction_entry_price = bar.close_price
-        elif macd_cross_down:
-            if self.pos > self.base_size and self.pos_avg_price > 0:
-                current_profit: float = round(
-                    (bar.close_price - self.pos_avg_price)
-                    / self.pos_avg_price
-                    * 100,
-                    2,
-                )
-                should_reduce: bool = (
-                    self.profit_take_min_points <= current_profit <= self.profit_take_points
-                    or True
-                )
-                if should_reduce:
-                    self._set_target_position(
-                        bar,
-                        max(self.base_size, self.pos - self.friction_size),
-                        "MACD下穿零轴，减摩擦仓"
-                    )
-                else:
-                    self._set_target_position(bar, self.pos)
-            else:
-                self._set_target_position(bar, self.pos)
-        else:
-            self._set_target_position(bar, self.pos)
-
-        self.put_event()
 
     def _read_persisted_strategy_data(self) -> dict:
         """读取本策略在 CTA 数据文件中的持久化变量。"""
@@ -485,6 +424,10 @@ class BottomFrictionStrategy(CtaTemplateService):
         """按当前交易日刷新当天清仓标记，兼容进程重启后的持久化恢复。"""
         self.cleared_trading_day = trading_day
         self.cleared_today = self._is_cleared_on(trading_day)
+        # 行业极强操作一天只做一次：跨交易日后自动解锁
+        self.sector_strong_today = bool(self.sector_strong_day) and (
+            self.sector_strong_day == trading_day.isoformat()
+        )
 
     def _is_cleared_on(self, trading_day: date) -> bool:
         """判断指定交易日是否已经清仓。"""
@@ -516,7 +459,7 @@ class BottomFrictionStrategy(CtaTemplateService):
 
         if trading_day != self.macd_trading_day:
             self.macd_trading_day = trading_day
-            self.macd_calculator.reset()
+            self.bar_signal.friction_signal.reset()
             self.macd_line = 0.0
             self.signal_line = 0.0
             self.macd_hist = 0.0
@@ -551,15 +494,6 @@ class BottomFrictionStrategy(CtaTemplateService):
         values: list[float] = self.daily_close_prices[-window:]
         return round(float(np.mean(values)), 2)
 
-    def _calc_macd(self, close_price: float) -> tuple[float, float, float]:
-        """通过共享流式组件计算最新 1 分钟 MACD。"""
-        result: MacdResult = self.macd_calculator.update(close_price)
-        if not result.ready:
-            return 0.0, 0.0, 0.0
-
-        macd, signal, histogram = result.as_tuple()
-        return round(macd, 2), round(signal, 2), round(histogram, 2)
-
     def _set_target_position(
         self,
         bar: BarData,
@@ -593,6 +527,9 @@ class BottomFrictionStrategy(CtaTemplateService):
                     )
                     for vt_orderid in vt_orderids:
                         self.active_buy_orders[vt_orderid] = reserved_volume
+                    # 行业极强入场：登记委托号，成交后据此记录该仓位的成交均价
+                    if mark == SECTOR_STRONG_ENTRY_MARK:
+                        self.sector_strong_orderids.update(vt_orderids)
         elif target_pos < self.pos:
             sell_volume: int = int(self.pos - target_pos)
             if sell_volume > 0:
@@ -639,6 +576,9 @@ class BottomFrictionStrategy(CtaTemplateService):
 
         if trade.direction == Direction.LONG and trade.offset == Offset.OPEN:
             new_position: bool = self.pos <= trade.volume
+            # 行业极强入场的成交：记录成交均价，供止盈停止单算触发价
+            if trade.vt_orderid in self.sector_strong_orderids:
+                self._record_sector_strong_fill(trade)
             if self.pos > trade.volume:
                 self.pos_avg_price = round(
                     (
@@ -649,33 +589,26 @@ class BottomFrictionStrategy(CtaTemplateService):
                 )
             else:
                 self.pos_avg_price = round(float(trade.price), 2)
-            self.peak_profit_points = max(
-                round(
-                    (trade.price - self.pos_avg_price)
-                    / self.pos_avg_price
-                    * 100,
-                    2,
-                ),
-                0.0,
+            self.profit_drawdown.reset_on_open(
+                trade.price, self.pos_avg_price, new_position
             )
-            if new_position:
-                self.profit_drawdown_active = False
-                self.profit_drawdown_pending = False
-                self.profit_protection_active = False
         elif trade.direction == Direction.SHORT and trade.offset == Offset.CLOSE:
             if self.pos <= 0:
                 self.pos_avg_price = 0.0
-                self.peak_profit_points = 0.0
-                self.profit_drawdown_pending = False
-                self.profit_drawdown_active = False
-                self.profit_protection_active = False
+                self.profit_drawdown.reset_on_close()
                 self._mark_cleared_today()
 
         if self.pos <= self.base_size:
             self.friction_entry_price = 0.0
+            # 摩擦位已清空：行业极强仓不复存在，入场价与累计成交一并清零
+            self._reset_sector_strong_position()
 
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder) -> None:
         """停止单更新回调。"""
         pass
+
+
+# 历史别名：部分测试/示例仍以 BottomFrictionMacdStrategy 引用本策略。
+BottomFrictionMacdStrategy = BottomFrictionStrategy
