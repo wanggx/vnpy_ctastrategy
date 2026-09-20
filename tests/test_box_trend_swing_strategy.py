@@ -122,7 +122,8 @@ class BoxTrendSwingStrategyTest(unittest.TestCase):
             volume=100,
             traded=50,
             status=Status.PARTTRADED,
-            reference="CtaStrategy_box_trend_test:通道下沿低吸",
+            reference="CtaStrategy_box_trend_test",
+            mark="通道下沿低吸",
         )
 
         self.strategy.on_order(order)

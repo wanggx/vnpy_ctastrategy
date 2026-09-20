@@ -886,7 +886,8 @@ class BacktestingEngine:
                 status=Status.ALLTRADED,
                 gateway_name=self.gateway_name,
                 datetime=self.datetime,
-                reference=self.create_order_reference(stop_order.mark)
+                reference=self.create_order_reference(),
+                mark=stop_order.mark
             )
 
             self.limit_orders[order.vt_orderid] = order
@@ -1059,7 +1060,8 @@ class BacktestingEngine:
             status=Status.SUBMITTING,
             gateway_name=self.gateway_name,
             datetime=self.datetime,
-            reference=self.create_order_reference(mark)
+            reference=self.create_order_reference(),
+            mark=mark
         )
 
         self.active_limit_orders[order.vt_orderid] = order
@@ -1070,12 +1072,9 @@ class BacktestingEngine:
 
         return order.vt_orderid
 
-    def create_order_reference(self, mark: str) -> str:
-        """Create an order reference containing the strategy and trigger mark."""
-        reference: str = f"{APP_NAME}_{self.strategy.strategy_name}"
-        if mark:
-            reference = f"{reference}:{mark}"
-        return reference
+    def create_order_reference(self) -> str:
+        """Create an order reference representing the strategy name."""
+        return f"{APP_NAME}_{self.strategy.strategy_name}"
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
         """

@@ -329,8 +329,7 @@ class CtaTemplate(ABC):
     @staticmethod
     def get_order_mark(order: OrderData) -> str:
         """Return the trigger mark carried by an order."""
-        _, separator, mark = order.reference.partition(":")
-        return mark if separator else ""
+        return order.mark
 
     def cancel_all(self) -> None:
         """
