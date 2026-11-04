@@ -44,6 +44,18 @@ from .template import CtaTemplate
 from .locale import _
 
 
+class _BacktestMainEngine:
+    """只提供情绪引擎查询，让策略原有的 get_sentiment_engine(main_engine) 能命中。"""
+
+    def __init__(self, sentiment_engine: Any) -> None:
+        self._sentiment_engine: Any = sentiment_engine
+
+    def get_engine(self, engine_name: str) -> Any:
+        if engine_name == "MarketSentiment":
+            return self._sentiment_engine
+        return None
+
+
 class BacktestingEngine:
     """"""
 
@@ -96,6 +108,37 @@ class BacktestingEngine:
 
         self.daily_results: dict[Date, DailyResult] = {}
         self.daily_df: DataFrame = DataFrame()
+        # 回测情绪。赋值后挂上 main_engine，策略仍只调 get_latest()。
+        self._sentiment_engine: Any = None
+        self._sentiment_main_engine: _BacktestMainEngine | None = None
+
+    @property
+    def sentiment_engine(self) -> Any:
+        """预计算情绪回放对象；策略通过 main_engine.get_engine 取到它。"""
+        return self._sentiment_engine
+
+    @sentiment_engine.setter
+    def sentiment_engine(self, engine: Any) -> None:
+        self._sentiment_engine = engine
+        if engine is None:
+            if getattr(self, "_sentiment_main_engine", None) is getattr(
+                self, "main_engine", None
+            ):
+                del self.main_engine
+            self._sentiment_main_engine = None
+            return
+        stub: _BacktestMainEngine = _BacktestMainEngine(engine)
+        self._sentiment_main_engine = stub
+        self.main_engine = stub
+
+    def _sync_sentiment_clock(self) -> None:
+        """每根 Bar/Tick 推进前把情绪时钟拨到当前回测时刻。"""
+        engine: Any = self._sentiment_engine
+        if engine is None:
+            return
+        setter: Any = getattr(engine, "set_datetime", None)
+        if callable(setter):
+            setter(self.datetime)
 
     def clear_data(self) -> None:
         """
@@ -749,6 +792,7 @@ class BacktestingEngine:
 
         self.cross_limit_order()
         self.cross_stop_order()
+        self._sync_sentiment_clock()
         self.strategy.on_bar(bar)
 
         self.update_daily_close(bar.close_price)
@@ -761,6 +805,7 @@ class BacktestingEngine:
 
         self.cross_limit_order()
         self.cross_stop_order()
+        self._sync_sentiment_clock()
         self.strategy.on_tick(tick)
 
         self.update_daily_close(tick.last_price)
